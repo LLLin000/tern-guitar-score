@@ -1,0 +1,17 @@
+schema = 1
+id = "gscore"
+name = "Guitar Score"
+version = "0.1.0"
+description = "AlphaTab-rendered score with clickable per-note targets."
+host = "host.luau"
+window = "window.luau"
+styles = ["hits.css"]
+
+[[blocks]]
+id = "score"
+title = "Guitar Score"
+files = ["*.musicxml", "*.xml", "*.mxl", "*.gp", "*.gp3", "*.gp4", "*.gp5", "*.gpx"]
+
+[[blocks]]
+id = "library"
+title = "Score Library"
