@@ -28,7 +28,24 @@ local STEP_MS = 5000
 local MAX_COLUMNS = 4
 
 type Occ = { t: number, nb: { number } }
-type Note = { id: number, b: number, x: number, y: number, w: number, h: number }
+type Note = {
+	id: number,
+	b: number,
+	m: number,
+	string: number,
+	fret: number,
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	durationTicks: number?,
+	tuplet: string?,
+	isTie: boolean?,
+	isHammerPull: boolean?,
+	isSlide: boolean?,
+	isGhost: boolean?,
+	isDead: boolean?,
+}
 type BeatBox = { i: number, x: number, y: number, w: number, h: number }
 type MeasureBox = { mb: number, x: number, y: number, w: number, h: number }
 type MeasureTime = { mb: number, t0: number, t1: number }
@@ -55,7 +72,12 @@ type Score = {
 	selB: number?,
 	selT0: number?,
 	selT1: number?,
-	segPath: string?,
+	speed: number,
+	countIn: boolean,
+	countInActive: boolean,
+	countInDuration: number?,
+	tempoBpm: number,
+	backendRunning: boolean,
 	tuning: { number },
 	timeSignature: { number },
 	cur: { [number]: boolean },
@@ -145,10 +167,18 @@ local function exportSelection(sc: Score)
 			if n.m >= lo and n.m <= hi then
 				local baseMidi = (sc.tuning and #sc.tuning >= n.string) and sc.tuning[n.string] or (OPEN[n.string] or 0)
 				table.insert(notes, {
+					id = n.id,
 					bar = n.m,
 					string = n.string,
 					fret = n.fret,
 					midi = baseMidi + (n.fret or 0),
+					duration_ticks = n.durationTicks,
+					tuplet = n.tuplet,
+					is_tie = n.isTie,
+					is_hammer_pull = n.isHammerPull,
+					is_slide = n.isSlide,
+					is_ghost = n.isGhost,
+					is_dead = n.isDead,
 				})
 			end
 		end
@@ -157,23 +187,27 @@ local function exportSelection(sc: Score)
 	local spans = {}
 	for _, o in ipairs(sc.timeline) do
 		if o.t >= (sc.selT0 or 0) and o.t <= (sc.selT1 or 0) then
-			table.insert(beats, o.t)
+			table.insert(beats, { t = o.t, beat_ids = o.nb })
 		end
 	end
 	for i = 1, #beats - 1 do
-		table.insert(spans, beats[i + 1] - beats[i])
+		table.insert(spans, beats[i + 1].t - beats[i].t)
 	end
 	table.sort(spans)
 	local payload = {
+		version = "1.1.0",
+		protocol = "music_context_v1",
+		timestamp_ms = math.floor(tern.now()),
 		path = sc.path,
 		title = sc.title,
 		bars = { lo, hi },
-		t0 = sc.selT0,
-		t1 = sc.selT1,
-		beat_ms = if #spans > 0 then spans[math.floor(#spans / 2) + 1] else nil,
+		playback_range_ms = { t0 = sc.selT0, t1 = sc.selT1 },
+		tempo_bpm = if #spans > 0 then math.floor(60000 / spans[math.floor(#spans / 2) + 1] + 0.5) else 120,
+		median_beat_ms = if #spans > 0 then spans[math.floor(#spans / 2) + 1] else nil,
 		time_signature = sc.timeSignature,
-		tuning = sc.tuning,
+		tuning_midi = sc.tuning,
 		notes = notes,
+		beats = beats,
 	}
 	pcall(tern.fs.write, tern.plugin.data .. "/selection.json", tern.json.encode(payload, true))
 end
@@ -208,10 +242,125 @@ end
 
 -- playback -----------------------------------------------------------------
 
+local function cmdFile(sc: Score): string
+	return sc.out .. "/audio_cmd.json"
+end
+
+local function stateFile(sc: Score): string
+	return sc.out .. "/audio_state.json"
+end
+
+local function sendCmd(sc: Score, payload: any)
+	pcall(tern.fs.write, cmdFile(sc), tern.json.encode(payload))
+end
+
+local function ensureBackend(sc: Score)
+	if sc.backendRunning then
+		return
+	end
+	pcall(tern.fs.write, hbFile(sc), tostring(math.floor(tern.now())))
+	pcall(function()
+		tern.process.run(
+			{ PYTHON, tern.plugin.dir .. "/audio_backend.py", sc.out },
+			{ timeout_ms = 9999999 }
+		):next(function()
+			sc.backendRunning = false
+		end)
+	end)
+	sc.backendRunning = true
+end
+
 local function playerStop(sc: Score)
-	pcall(tern.fs.write, hbFile(sc), "0")
+	sendCmd(sc, { action = "stop" })
 	sc.playing = false
 	sc.armed = false
+	sc.cur = {}
+end
+
+local function playerPause(sc: Score)
+	sendCmd(sc, { action = "pause" })
+	sc.playing = false
+end
+
+local function playerSeek(sc: Score, pos_ms: number)
+	sendCmd(sc, { action = "seek", pos_ms = math.floor(pos_ms) })
+	sc.pos = pos_ms
+end
+
+local function playerSpeed(sc: Score, speed: number)
+	sc.speed = speed
+	sendCmd(sc, { action = "speed", speed = speed })
+end
+
+local function playerLoop(sc: Score, a_ms: number?, b_ms: number?)
+	sendCmd(sc, { action = "loop", loop_a_ms = a_ms, loop_b_ms = b_ms })
+end
+
+local function startAudioLoop(state: State, cx: any, sc: Score)
+	local session = sc.session
+	local lastSig = ""
+	local function tick()
+		if session ~= sc.session then
+			return
+		end
+		if not sc.playing and not sc.countInActive then
+			return
+		end
+		-- Update heartbeat to keep backend alive
+		pcall(tern.fs.write, hbFile(sc), tostring(math.floor(tern.now())))
+		
+		-- Read true audio clock from backend state file
+		local ok, text = pcall(tern.fs.read, stateFile(sc))
+		if ok and text ~= "" then
+			local okj, data = pcall(tern.json.decode, text)
+			if okj and type(data) == "table" then
+				if data.pos_ms ~= nil then
+					sc.pos = data.pos_ms
+				end
+				if data.duration_ms ~= nil and data.duration_ms > 0 then
+					sc.countInDuration = data.duration_ms
+				end
+				if sc.countInActive then
+					-- count-in finished: switch to real playback
+					if data.playing == false and data.pos_ms >= (sc.countInDuration or 1900) - 50 then
+						sc.countInActive = false
+						sc.playing = true
+						sc.pos = sc.from
+						local full = sc.out .. "/full.wav"
+						sendCmd(sc, { action = "load", file = full, pos_ms = math.floor(sc.from), paused = false })
+						if sc.speed ~= 1.0 then
+							sendCmd(sc, { action = "speed", speed = sc.speed })
+						end
+						if sc.loop then
+							local a, b = loopRange(sc)
+							playerLoop(sc, a, b)
+						end
+					end
+				elseif data.playing ~= nil then
+					sc.playing = data.playing and not data.paused
+				end
+			end
+		end
+
+		sc.cur = beatsAt(sc, sc.pos)
+		local ids = {}
+		for id in pairs(sc.cur) do
+			table.insert(ids, id)
+		end
+		table.sort(ids)
+		local sig = table.concat(ids, ",")
+		if sig ~= lastSig then
+			lastSig = sig
+			cx:render()
+		end
+
+		if sc.playing or sc.countInActive then
+			tern.timer(TICK_MS, tick)
+		else
+			cx:render()
+		end
+	end
+	tern.timer(TICK_MS, tick)
 end
 
 local function playFrom(state: State, cx: any, sc: Score, from: number, to: number)
@@ -220,112 +369,47 @@ local function playFrom(state: State, cx: any, sc: Score, from: number, to: numb
 			playerStop(other)
 		end
 	end
-	playerStop(sc)
+	ensureBackend(sc)
 	sc.session = newSession()
-	local session = sc.session
-	sc.pos, sc.from, sc.to = from, from, to
-	sc.playing = true
-	sc.armed = false
-	sc.startedAt = 0
-	local stamp = stampFile(sc)
-	pcall(tern.fs.remove, stamp)
+	sc.from, sc.to = from, to
 
-	local needSlice = from > 0 or to < sc.duration
-	local seg = string.format("%s/seg-%d-%d.wav", sc.out, math.floor(from), math.floor(to))
-	local full = sc.out .. "/full.wav"
-	local seconds = tostring(math.max(0.2, (to - from) / 1000 + 0.4))
-	local spawnAt = tern.now()
-	local lastSig = ""
-
-	local function start(file: string)
-		pcall(tern.fs.write, hbFile(sc), session)
-		local okp, perr = pcall(function()
-			tern.process.run(
-				{ PYTHON, tern.plugin.dir .. "/player.py", file, hbFile(sc), session, seconds, stamp },
-				{ timeout_ms = 900000 }
-			):next(function() end)
-		end)
-		if not okp then
-			pcall(tern.fs.write, sc.out .. "/spawn-error.txt", tostring(perr))
-		end
-
-		local function tick()
-			if session ~= sc.session or not sc.playing then
-				return
-			end
-			if not sc.armed then
-				if tern.fs.exists(stamp) then
-					sc.startedAt = tern.now() - TICK_MS / 2
-					sc.armed = true
-				elseif tern.now() - spawnAt > 8000 then
-					playerStop(sc)
-					sc.cur = {}
-					cx:render()
-					return
-				else
-					tern.timer(TICK_MS, tick)
-					return
-				end
-			end
-			local elapsed = tern.now() - sc.startedAt
-			local pos = math.min(to, from + elapsed)
-			sc.pos = pos
-			if pos >= to then
-				if sc.loop then
-					local a, b = loopRange(sc)
-					playFrom(state, cx, sc, a, b)
-					return
-				end
-				playerStop(sc)
-				sc.cur = {}
-				sc.pos = to
-				cx:render()
-				return
-			end
-			pcall(tern.fs.write, hbFile(sc), session)
-			sc.cur = beatsAt(sc, pos)
-			local ids = {}
-			for id in pairs(sc.cur) do
-				table.insert(ids, id)
-			end
-			table.sort(ids)
-			local sig = table.concat(ids, ",")
-			if sig ~= lastSig then
-				lastSig = sig
-				cx:render()
-			end
-			tern.timer(TICK_MS, tick)
-		end
-		tern.timer(TICK_MS, tick)
+	-- count-in: 1 bar of metronome ticks before the real playback
+	local countInPath = sc.out .. "/count_in.wav"
+	if sc.countIn and from <= 0 and tern.fs.exists(countInPath) then
+		sc.countInActive = true
+		sc.playing = false
+		sc.pos = 0
+		sendCmd(sc, { action = "load", file = countInPath, pos_ms = 0, paused = false })
+		startAudioLoop(state, cx, sc)
 		cx:render()
+		return
 	end
 
-	if not needSlice then
-		start(full)
-		return
+	sc.countInActive = false
+	sc.pos = from
+	sc.playing = true
+
+	local full = sc.out .. "/full.wav"
+	sendCmd(sc, { action = "load", file = full, pos_ms = math.floor(from), paused = false })
+	if sc.speed ~= 1.0 then
+		sendCmd(sc, { action = "speed", speed = sc.speed })
 	end
-	if sc.segPath == seg and tern.fs.exists(seg) then
-		start(seg)
-		return
+
+	if sc.loop then
+		local a, b = loopRange(sc)
+		playerLoop(sc, a, b)
+	else
+		playerLoop(sc, nil, nil)
 	end
-	tern.process.run({
-		PYTHON, tern.plugin.dir .. "/slice.py", full, seg,
-		tostring(math.floor(from)), tostring(math.floor(to)),
-	}, { timeout_ms = 23000 }):next(function(res)
-		if res and res.status == 0 then
-			sc.segPath = seg
-			start(seg)
-		else
-			start(full)
-		end
-	end)
+
+	startAudioLoop(state, cx, sc)
+	cx:render()
 end
-
--- loading ------------------------------------------------------------------
 
 local function applyJson(cx: any, sc: Score, data: any)
 	sc.title = data.title or "Score"
 	sc.tuning = data.tuning or {}
+	sc.tempoBpm = data.tempo_bpm or 120
 	sc.timeSignature = data.timeSignature or { 4, 4 }
 	sc.duration = data.duration or 0
 	sc.to = sc.duration
@@ -475,7 +559,7 @@ local function column(state: State, index: number, sc: Score): Node
 		end
 		table.insert(rows, ui.node("image", {
 			blob = sys.blob, w = sys.w, h = sys.h, alt = sys.png,
-			role = "score",
+			role = if bar ~= nil then "score-active" else "score",
 		}, hits))
 	end
 
@@ -515,7 +599,12 @@ local def: BlockDef<State> = {
 				selB = nil,
 				selT0 = nil,
 				selT1 = nil,
-				segPath = nil,
+				speed = 1.0,
+				countIn = true,
+				countInActive = false,
+				countInDuration = nil,
+				tempoBpm = 120,
+				backendRunning = false,
 				tuning = {},
 				timeSignature = { 4, 4 },
 				cur = {},
@@ -582,7 +671,19 @@ local def: BlockDef<State> = {
 			table.insert(bar, button("folder-open", "library", "Open a score file…"))
 			table.insert(bar, button("repeat", "loop", "Loop the selected bar",
 				if sc.loop then "accent" else "muted"))
-			local marks = clock(sc.pos) .. " / " .. clock(sc.duration)
+			-- Count-in toggle button
+			table.insert(bar, button("sparkle", "count_in_toggle", "Count-in: " .. (if sc.countIn then "ON" else "OFF"),
+				if sc.countIn then "accent" else "muted"))
+			-- Speed button
+			local speedLabel = string.format("%.2fx", sc.speed or 1.0)
+			table.insert(bar, button("speed", "speed_cycle", "Speed: " .. speedLabel .. " (click to cycle 0.75x/1.0x/1.25x)"))
+			
+			local marks = ""
+			if sc.countInActive then
+				marks = "PREP... " .. clock(sc.pos)
+			else
+				marks = clock(sc.pos) .. " / " .. clock(sc.duration) .. " [" .. speedLabel .. "]"
+			end
 			if sc.loop then
 				local lo, hi = loopRange(sc)
 				marks = marks .. "  loop " .. clock(lo) .. "-" .. clock(hi)
@@ -608,23 +709,33 @@ local def: BlockDef<State> = {
 		end
 		if key.name == "space" then
 			if sc.playing then
-				playerStop(sc)
+				playerPause(sc)
 			else
-				playFrom(state, cx, sc, startPos(sc), endPos(sc))
+				if sc.pos > 0 and sc.pos < sc.duration then
+					ensureBackend(sc)
+					sc.playing = true
+					sendCmd(sc, { action = "play" })
+					startAudioLoop(state, cx, sc)
+				else
+					playFrom(state, cx, sc, startPos(sc), endPos(sc))
+				end
 			end
 			cx:render()
 			return true
 		elseif key.name == "a" then
 			sc.markA, sc.loop = sc.pos, true
+			playerLoop(sc, nil, nil)
 			cx:render()
 			return true
 		elseif key.name == "b" then
 			sc.markB, sc.loop = sc.pos, true
+			playerLoop(sc, sc.markA, sc.markB)
 			cx:render()
 			return true
 		elseif key.name == "escape" then
 			sc.markA, sc.markB, sc.loop = nil, nil, false
 			sc.selA, sc.selB, sc.selT0, sc.selT1 = nil, nil, nil, nil
+			playerLoop(sc, nil, nil)
 			cx:render()
 			return true
 		elseif key.name == "tab" then
@@ -657,43 +768,58 @@ local def: BlockDef<State> = {
 			return
 		end
 		if act == "playpause" or act == "stop" or act == "home" or act == "back"
-			or act == "fwd" or act == "loop" then
+			or act == "fwd" or act == "loop" or act == "speed_cycle" then
 			local sc0 = state.scores[state.active]
 			if sc0 == nil or sc0.status ~= "ready" then
 				return
 			end
 			if act == "playpause" then
 				if sc0.playing then
-					playerStop(sc0)
+					playerPause(sc0)
 				else
-					playFrom(state, cx, sc0, startPos(sc0), endPos(sc0))
+					if sc0.pos > 0 and sc0.pos < sc0.duration then
+						ensureBackend(sc0)
+						sc0.playing = true
+						sendCmd(sc0, { action = "play" })
+						startAudioLoop(state, cx, sc0)
+					else
+						playFrom(state, cx, sc0, startPos(sc0), endPos(sc0))
+					end
 				end
+			elseif act == "count_in_toggle" then
+				sc0.countIn = not sc0.countIn
+			elseif act == "speed_cycle" then
+				local nextSpeed = 1.0
+				if math.abs((sc0.speed or 1.0) - 1.0) < 0.05 then
+					nextSpeed = 1.25
+				elseif math.abs((sc0.speed or 1.0) - 1.25) < 0.05 then
+					nextSpeed = 0.75
+				else
+					nextSpeed = 1.0
+				end
+				playerSpeed(sc0, nextSpeed)
 			elseif act == "loop" then
 				sc0.loop = not sc0.loop
 				if not sc0.loop then
 					sc0.selA, sc0.selB, sc0.selT0, sc0.selT1 = nil, nil, nil, nil
+					playerLoop(sc0, nil, nil)
+				else
+					local a, b = loopRange(sc0)
+					playerLoop(sc0, a, b)
 				end
-			else
-				local wasPlaying = sc0.playing
+			elseif act == "stop" then
 				playerStop(sc0)
-				if act == "stop" then
-					sc0.pos = 0
-				elseif act == "home" then
-					sc0.pos = 0
-				elseif act == "back" then
-					sc0.pos = math.max(0, sc0.pos - STEP_MS)
-				elseif act == "fwd" then
-					sc0.pos = math.min(sc0.duration, sc0.pos + STEP_MS)
-				end
-				sc0.cur = beatsAt(sc0, sc0.pos)
-				if wasPlaying then
-					playFrom(state, cx, sc0, sc0.pos, sc0.duration)
-				end
+				sc0.pos = 0
+			elseif act == "home" then
+				playerSeek(sc0, 0)
+			elseif act == "back" then
+				playerSeek(sc0, math.max(0, sc0.pos - STEP_MS))
+			elseif act == "fwd" then
+				playerSeek(sc0, math.min(sc0.duration, sc0.pos + STEP_MS))
 			end
 			cx:render()
 			return
 		end
-
 		local which, what = string.match(tostring(ev.value or ""), "^(%d+):(%d+)$")
 		local index = tonumber(which or "")
 		local sc = index and state.scores[index]
@@ -707,10 +833,12 @@ local def: BlockDef<State> = {
 				return
 			end
 			local want: number? = nil
+			local targetNote: Note? = nil
 			for _, sys in ipairs(sc.systems) do
 				for _, n in ipairs(sys.notes) do
 					if n.id == id then
 						want = n.b
+						targetNote = n
 					end
 				end
 			end
@@ -725,7 +853,13 @@ local def: BlockDef<State> = {
 					end
 				end
 			end
-			playFrom(state, cx, sc, at, sc.duration)
+			-- Click note seeks to that beat directly via mpv seek
+			ensureBackend(sc)
+			playerSeek(sc, at)
+			if not sc.playing then
+				sc.cur = beatsAt(sc, at)
+			end
+			cx:render()
 		elseif ev.act == "meas" then
 			local mb = tonumber(what or "")
 			if not mb then

@@ -4,3 +4,8 @@ node_modules/
 *.stamp
 *.flag
 __pycache__/
+
+bin/
+*.sock
+audio_cmd.json
+audio_state.json

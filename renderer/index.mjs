@@ -80,8 +80,30 @@ if (lookup) {
             const hb = nb.noteHeadBounds;
             if (!hb || !hb.w) continue;
             const n = nb.note;
-            rawNotes.push({ beat, string: n ? n.string : null, fret: n ? n.fret : null,
-              x: hb.x, y: hb.y, w: hb.w, h: hb.h });
+            rawNotes.push({
+              beat,
+              string: n ? n.string : null,
+              fret: n ? n.fret : null,
+              // complete musical semantics for the agent protocol
+              realValue: n ? n.realValue : null,
+              isTieOrigin: n ? n.isTieOrigin : false,
+              isTieDestination: n ? n.isTieDestination : false,
+              isHammerPullOrigin: n ? n.isHammerPullOrigin : false,
+              isHammerPullDestination: n ? n.isHammerPullDestination : false,
+              isSlideOrigin: n ? n.isSlideOrigin : false,
+              isSlideDestination: n ? n.isSlideDestination : false,
+              isGhost: n ? n.isGhost : false,
+              isDead: n ? n.isDead : false,
+              bendType: n && n.bendType !== undefined ? n.bendType : null,
+              beatDurationTicks: beat ? beat.playbackDuration : null,
+              beatDotCount: beat ? beat.dotCount : 0,
+              beatTuplet: beat && beat.tuplet ? beat.tuplet.numerator + ":" + beat.tuplet.denominator : null,
+              voiceIndex: sb.bar && sb.bar.voice ? sb.bar.voice.index : null,
+              barIndex: idx,
+              trackIndex: 0,
+              stableId: (idx * 10000 + rawNotes.length),
+              x: hb.x, y: hb.y, w: hb.w, h: hb.h,
+            });
           }
         }
       }
@@ -188,9 +210,18 @@ const systems = chunks.map((c) => {
     const x1 = Math.min(c.w, n.x + n.w + PAD - c.x);
     const y1 = Math.min(c.h, n.y + n.h + PAD - c.y);
     return {
+      id: n.stableId,
       b: beatIds.get(n.beat) ?? -1,
       m: beatBar.get(n.beat) ?? -1,
-      string: n.string, fret: n.fret,
+      string: n.string,
+      fret: n.fret,
+      durationTicks: n.beatDurationTicks,
+      tuplet: n.beatTuplet,
+      isTie: n.isTieOrigin || n.isTieDestination,
+      isHammerPull: n.isHammerPullOrigin || n.isHammerPullDestination,
+      isSlide: n.isSlideOrigin || n.isSlideDestination,
+      isGhost: n.isGhost,
+      isDead: n.isDead,
       x: x0 / c.w, y: y0 / c.h, w: (x1 - x0) / c.w, h: (y1 - y0) / c.h,
     };
   }),
@@ -273,6 +304,49 @@ head.write("data", 36);
 head.writeUInt32LE(pcm.length, 40);
 fs.writeFileSync(path.join(outDir, "full.wav"), Buffer.concat([head, pcm]));
 
+// ---------- count-in click track (1 bar of metronome ticks)
+{
+  const firstBar = score.masterBars[0];
+  const bpm = (marks.find(m => m.tick === 0) || {}).tempo || score.tempo || 120;
+  const beatsPerBar = firstBar ? firstBar.timeSignatureNumerator : 4;
+  const beatMs = 60000 / bpm;
+  const barMs = beatMs * beatsPerBar;
+  const CLICK_SR = 44100;
+  const total = Math.floor((barMs / 1000) * CLICK_SR);
+  const clickPcm = new Int16Array(total);
+  const tickSamples = Math.floor(0.03 * CLICK_SR);
+  for (let b = 0; b < beatsPerBar; b++) {
+    const offset = Math.floor((b * beatMs / 1000) * CLICK_SR);
+    const freq = b === 0 ? 1600 : 1000;
+    const amp = b === 0 ? 0.6 : 0.35;
+    for (let i = 0; i < tickSamples && offset + i < total; i++) {
+      const decay = Math.exp(-i / (tickSamples * 0.25));
+      const v = Math.sin((2 * Math.PI * freq * i) / CLICK_SR) * decay * amp;
+      clickPcm[offset + i] = Math.max(-32767, Math.min(32767, Math.round(v * 32767)));
+    }
+  }
+  const clickPcmBuf = Buffer.alloc(total * 2);
+  for (let i = 0; i < total; i++) {
+    clickPcmBuf.writeInt16LE(clickPcm[i], i * 2);
+  }
+  const cHead = Buffer.alloc(44);
+  cHead.write("RIFF", 0);
+  cHead.writeUInt32LE(36 + clickPcmBuf.length, 4);
+  cHead.write("WAVE", 8);
+  cHead.write("fmt ", 12);
+  cHead.writeUInt32LE(16, 16);
+  cHead.writeUInt16LE(1, 20);
+  cHead.writeUInt16LE(1, 22);
+  cHead.writeUInt32LE(CLICK_SR, 24);
+  cHead.writeUInt32LE(CLICK_SR * 2, 28);
+  cHead.writeUInt16LE(2, 32);
+  cHead.writeUInt16LE(16, 34);
+  cHead.write("data", 36);
+  cHead.writeUInt32LE(clickPcmBuf.length, 40);
+  fs.writeFileSync(path.join(outDir, "count_in.wav"), Buffer.concat([cHead, clickPcmBuf]));
+}
+
+
 console.log(JSON.stringify({
   ok: true,
   title: score.title || path.basename(input),
@@ -281,6 +355,10 @@ console.log(JSON.stringify({
     ? score.tracks[0].staves[0].stringTuning.tunings.slice() : []),
   timeSignature: score.masterBars[0]
     ? [score.masterBars[0].timeSignatureNumerator, score.masterBars[0].timeSignatureDenominator] : [4, 4],
+  tempo_bpm: (() => {
+    const first = marks.find(m => m.tick === 0);
+    return first ? first.tempo : (score.tempo || 120);
+  })(),
   peak: Number(maxAbs.toFixed(3)),
   timeline,
   measureTimes,

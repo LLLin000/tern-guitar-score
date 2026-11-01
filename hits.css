@@ -1,3 +1,12 @@
+.sf-image[data-role="score-active"] {
+	object-fit: contain;
+	align-self: flex-start;
+	width: auto;
+	max-width: 100%;
+	height: auto;
+	scroll-margin-top: 54px;
+}
+
 .sf-image[data-role="score"] {
 	object-fit: contain;
 	align-self: flex-start;
