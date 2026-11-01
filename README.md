@@ -98,15 +98,21 @@ consumes the file atomically and reports state in `audio_state.json` every 30 ms
 
 ## Tests
 
+Both suites run against the repo-local fixture `tests/fixtures/sample.musicxml`, so they need no
+private paths.
+
 ```bash
-python tests/test_audio_backend.py     # audio engine: burst commands, speed ratio, pause survival, A-B loop
-node renderer/index.mjs ...            # engine smoke: 8 formats render with notes + audio
+python tests/test_audio_backend.py     # burst queue, 1.25x ratio, 6s pause watchdog
+python tests/test_concurrency.py       # atomic cmds/ queue, monotonic seq, A-B bounds,
+                                       # 10s pause resume position, zero orphan mpv (Job Object)
 ```
+
 
 ## Known limits
 
-- No automatic scrolling yet: the active system row is highlighted (`role="score-active"`) and
-  carries `scroll-margin-top`, but nothing scrolls it into view.
+- Viewport follow issues a TSP `["reveal", key, "nearest"]` frame op when the active system
+  changes, and the active row carries `role="score-active"` as a fallback highlight. The reveal
+  path has not been verified against a live Tern window yet.
 - Count-in length assumes one tempo for the first bar; 6/8 and other compound metres need the
   time signature's beat unit rather than the numerator.
 - Viewport width changes re-render into a separate cache directory (`<score>@<width>`) but the

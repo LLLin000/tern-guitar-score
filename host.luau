@@ -78,6 +78,11 @@ type Score = {
 	countInDuration: number?,
 	tempoBpm: number,
 	backendRunning: boolean,
+	cmdSeq: number,
+	loopToken: number,
+	backendSeq: number?,
+	lastBackendActiveAt: number?,
+	lastActiveSys: number?,
 	tuning: { number },
 	timeSignature: { number },
 	cur: { [number]: boolean },
@@ -242,10 +247,13 @@ end
 
 -- playback -----------------------------------------------------------------
 
--- append-only JSONL queue: a single-slot file loses commands when the
--- backend has not read the previous one yet (load -> speed -> loop)
-local function cmdFile(sc: Score): string
-	return sc.out .. "/audio_cmd.jsonl"
+-- atomic per-command queue: each command is an isolated sequentially
+-- numbered file inside `<cache>/cmds/`. This eliminates all read-modify-write
+-- races between Luau writers and the python reader.
+local function cmdsDir(sc: Score): string
+	local dir = sc.out .. "/cmds"
+	pcall(tern.fs.mkdir, dir)
+	return dir
 end
 
 local function stateFile(sc: Score): string
@@ -253,24 +261,26 @@ local function stateFile(sc: Score): string
 end
 
 local function sendCmd(sc: Score, payload: any)
-	local line = tern.json.encode(payload, false):gsub("\n", "") .. "\n"
-	local ok, existing = pcall(tern.fs.read, cmdFile(sc))
-	local prev = if ok then existing else ""
-	-- the backend truncates the file; a stale tail would replay old commands
-	if #prev > 262144 then
-		prev = ""
-	end
-	pcall(tern.fs.write, cmdFile(sc), prev .. line)
+	sc.cmdSeq = (sc.cmdSeq or 0) + 1
+	local path = string.format("%s/%08d.json", cmdsDir(sc), sc.cmdSeq)
+	pcall(tern.fs.write, path, tern.json.encode(payload, false))
 end
 
+-- self-healing backend watcher: relies on strictly monotonic sequence numbers
+-- and mtime freshness measured exclusively within `tern.now()` domain.
+-- NEVER compares `tern.now()` to python's unix-epoch `time.time()*1000`.
 local function ensureBackend(sc: Score)
 	if sc.backendRunning then
 		local ok, text = pcall(tern.fs.read, stateFile(sc))
 		if ok and text ~= "" then
 			local okj, data = pcall(tern.json.decode, text)
-			if okj and type(data) == "table" and data.heartbeat ~= nil then
-				local delta = math.abs(tern.now() - data.heartbeat)
-				if delta < 6000 then
+			if okj and type(data) == "table" and data.seq ~= nil then
+				local now = tern.now()
+				if sc.backendSeq == nil or data.seq ~= sc.backendSeq then
+					sc.backendSeq = data.seq
+					sc.lastBackendActiveAt = now
+					return
+				elseif sc.lastBackendActiveAt ~= nil and (now - sc.lastBackendActiveAt) < 6000 then
 					return
 				end
 			end
@@ -286,6 +296,7 @@ local function ensureBackend(sc: Score)
 		end)
 	end)
 	sc.backendRunning = true
+	sc.lastBackendActiveAt = tern.now()
 end
 
 local function playerStop(sc: Score)
@@ -314,15 +325,18 @@ local function playerLoop(sc: Score, a_ms: number?, b_ms: number?)
 	sendCmd(sc, { action = "loop", loop_a_ms = a_ms, loop_b_ms = b_ms })
 end
 
+-- single polling loop per score: each invocation gets a unique `myToken`.
+-- If state restarts or resumes, previous loops observe token mismatch and exit cleanly.
 local function startAudioLoop(state: State, cx: any, sc: Score)
+	sc.loopToken = (sc.loopToken or 0) + 1
+	local myToken = sc.loopToken
 	local session = sc.session
 	local lastSig = ""
 	local function tick()
-		if session ~= sc.session then
+		if myToken ~= sc.loopToken or session ~= sc.session then
 			return
 		end
-		-- Keep the backend alive even while paused: if the heartbeat stops the
-		-- watchdog reaps mpv and a later resume has nothing to play into.
+		-- Keep backend alive even while paused
 		pcall(tern.fs.write, hbFile(sc), tostring(math.floor(tern.now())))
 		if not sc.playing and not sc.countInActive then
 			if sc.backendRunning then
@@ -336,6 +350,10 @@ local function startAudioLoop(state: State, cx: any, sc: Score)
 		if ok and text ~= "" then
 			local okj, data = pcall(tern.json.decode, text)
 			if okj and type(data) == "table" then
+				if data.seq ~= nil and data.seq ~= sc.backendSeq then
+					sc.backendSeq = data.seq
+					sc.lastBackendActiveAt = tern.now()
+				end
 				if data.pos_ms ~= nil then
 					sc.pos = data.pos_ms
 				end
@@ -343,7 +361,6 @@ local function startAudioLoop(state: State, cx: any, sc: Score)
 					sc.countInDuration = data.duration_ms
 				end
 				if sc.countInActive then
-					-- count-in finished: switch to real playback
 					if data.playing == false and data.pos_ms >= (sc.countInDuration or 1900) - 50 then
 						sc.countInActive = false
 						sc.playing = true
@@ -371,12 +388,34 @@ local function startAudioLoop(state: State, cx: any, sc: Score)
 		end
 		table.sort(ids)
 		local sig = table.concat(ids, ",")
+				-- Viewport follow: when playback crosses to a new system row,
+		-- reveal it into view via TSP raw frame op ["reveal", nodeId, "nearest"]
+		local activeSys: number? = nil
+		for sidx, sys in ipairs(sc.systems) do
+			for id in pairs(sc.cur) do
+				for _, b in ipairs(sys.beats) do
+					if b.i == id then
+						activeSys = sidx
+						break
+					end
+				end
+				if activeSys ~= nil then break end
+			end
+			if activeSys ~= nil then break end
+		end
+		if activeSys ~= nil and activeSys ~= sc.lastActiveSys then
+			sc.lastActiveSys = activeSys
+			local nodeKey = string.format("sys_%d_%d", state.active, activeSys)
+			pcall(function()
+				cx:frame({ { "reveal", nodeKey, "nearest" } })
+			end)
+		end
 		if sig ~= lastSig then
 			lastSig = sig
 			cx:render()
 		end
 
-		if sc.playing or sc.countInActive then
+		if myToken == sc.loopToken and (sc.playing or sc.countInActive) then
 			tern.timer(TICK_MS, tick)
 		else
 			cx:render()
@@ -551,7 +590,7 @@ local function column(state: State, index: number, sc: Score): Node
 	end
 
 	local rows: { Node } = {}
-	for _, sys in ipairs(sc.systems) do
+	for sindex, sys in ipairs(sc.systems) do
 		local hits: { Node } = {}
 		for _, m in ipairs(sys.measures) do
 			local cls = "gmeas " .. box(m)
@@ -583,9 +622,12 @@ local function column(state: State, index: number, sc: Score): Node
 		if bar ~= nil then
 			table.insert(hits, ui.el("div", { class = "gbar " .. box(bar) }))
 		end
+		local isCurSys = (bar ~= nil)
+		local nodeKey = string.format("sys_%d_%d", index, sindex)
 		table.insert(rows, ui.node("image", {
+			key = nodeKey,
 			blob = sys.blob, w = sys.w, h = sys.h, alt = sys.png,
-			role = if bar ~= nil then "score-active" else "score",
+			role = if isCurSys then "score-active" else "score",
 		}, hits))
 	end
 
@@ -631,6 +673,11 @@ local def: BlockDef<State> = {
 				countInDuration = nil,
 				tempoBpm = 120,
 				backendRunning = false,
+				cmdSeq = 0,
+				loopToken = 0,
+				backendSeq = nil,
+				lastBackendActiveAt = nil,
+				lastActiveSys = nil,
 				tuning = {},
 				timeSignature = { 4, 4 },
 				cur = {},

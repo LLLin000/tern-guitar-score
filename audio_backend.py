@@ -14,14 +14,18 @@ import win32pipe
 Usage:
   python audio_backend.py <cache_dir>
 
-Robustness guarantees:
+Concurrency & Robustness:
   - Windows Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:
-    If this python process terminates or is killed for ANY reason, mpv.exe is
-    terminated instantly by the Windows kernel. Zero zombie audio playback.
-  - Non-blocking PeekNamedPipe reader thread to avoid pipe hangs.
-  - JSONL command queue for atomic, ordered execution without command loss.
-  - Authoritative time-pos feedback every 30ms via audio_state.json.
-  - 15s watchdog tied to heartbeat.txt.
+    Kernel-guaranteed termination of mpv child process on parent exit.
+  - Command input:
+      1) Ordered per-command atomic files in `<cache_dir>/cmds/*.json`
+      2) Legacy JSONL queue `<cache_dir>/audio_cmd.jsonl`
+  - Atomic state broadcast every 30ms via `<cache_dir>/audio_state.json` with:
+      - `instance_id`: string (unique per backend run)
+      - `seq`: int (strictly incrementing on each state tick)
+      - `pos_ms`, `duration_ms`, `speed`, `playing`, `paused`, `loop`, `loop_a_ms`, `loop_b_ms`
+  - Non-blocking PeekNamedPipe reader loop.
+  - load_generation tracked seek: ensures seek after loadfile is never dropped or misattributed.
 """
 
 def get_mpv_path():
@@ -38,6 +42,7 @@ class MpvController:
     def __init__(self, cache_dir):
         self.cache_dir = os.path.abspath(cache_dir)
         folder_clean = os.path.basename(self.cache_dir).replace("@", "_").replace(":", "_")
+        self.instance_id = f"{os.getpid()}_{int(time.time()*1000)}"
         self.pipe_name = f"gscore_mpv_{folder_clean}_{os.getpid()}"
         self.full_pipe = "\\\\.\\pipe\\" + self.pipe_name
         self.mpv_exe = get_mpv_path()
@@ -45,10 +50,15 @@ class MpvController:
         self.handle = None
         self.job = None
         self.lock = threading.Lock()
-        self.pending_seek = None
+        
+        self.load_generation = 0
+        self.pending_seek = None  # (generation, target_ms)
         self.file_loaded = False
+        self.seq = 0
         
         self.state = {
+            "instance_id": self.instance_id,
+            "seq": 0,
             "playing": False,
             "paused": True,
             "pos_ms": 0,
@@ -62,7 +72,6 @@ class MpvController:
         self.running = True
 
     def start_mpv(self):
-        # 1. Bind to Windows Job Object so child process dies automatically with parent
         try:
             self.job = win32job.CreateJobObject(None, "")
             info = win32job.QueryInformationJobObject(self.job, win32job.JobObjectExtendedLimitInformation)
@@ -88,7 +97,6 @@ class MpvController:
             except Exception:
                 pass
 
-        # Connect using win32file
         connected = False
         for _ in range(60):
             try:
@@ -107,7 +115,6 @@ class MpvController:
         if not connected:
             raise RuntimeError(f"Could not connect to mpv named pipe: {self.full_pipe}")
 
-        # Start non-blocking reader thread
         self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.reader_thread.start()
 
@@ -122,11 +129,17 @@ class MpvController:
             except Exception:
                 pass
 
+    def _dispatch_pending_seek(self):
+        if self.pending_seek is not None:
+            gen, target_ms = self.pending_seek
+            if gen == self.load_generation:
+                self._send_command(["seek", max(0, target_ms) / 1000.0, "absolute"])
+            self.pending_seek = None
+
     def _read_loop(self):
         buf = ""
         while self.running and self.handle:
             try:
-                # Peek first to prevent blocking read
                 with self.lock:
                     if not self.handle:
                         break
@@ -152,12 +165,10 @@ class MpvController:
                             event = data.get("event")
                             if event == "file-loaded":
                                 self.file_loaded = True
+                                self._dispatch_pending_seek()
                             elif event == "playback-restart":
                                 self.state["playing"] = True
-                                if self.pending_seek is not None:
-                                    target = self.pending_seek
-                                    self.pending_seek = None
-                                    self._send_command(["seek", max(0, target) / 1000.0, "absolute"])
+                                self._dispatch_pending_seek()
                             elif event == "end-file":
                                 self.state["playing"] = False
                                 self.state["paused"] = True
@@ -174,7 +185,6 @@ class MpvController:
                                 elif prop == "speed" and val is not None:
                                     self.state["speed"] = float(val)
                             elif "data" in data and isinstance(data["data"], (int, float)):
-                                # Direct property query response for time-pos
                                 self.state["pos_ms"] = int(data["data"] * 1000)
                 else:
                     time.sleep(0.015)
@@ -183,8 +193,9 @@ class MpvController:
 
     def load_file(self, file_path, start_ms=0, paused=False):
         clean_path = os.path.abspath(file_path).replace("\\", "/")
+        self.load_generation += 1
         self.file_loaded = False
-        self.pending_seek = start_ms if start_ms > 0 else None
+        self.pending_seek = (self.load_generation, start_ms) if start_ms > 0 else None
         self._send_command(["loadfile", clean_path, "replace"])
         self._send_command(["observe_property", 1, "time-pos"])
         self._send_command(["observe_property", 2, "duration"])
@@ -214,7 +225,7 @@ class MpvController:
     def seek(self, target_ms):
         self.state["pos_ms"] = int(target_ms)
         if not self.file_loaded:
-            self.pending_seek = target_ms
+            self.pending_seek = (self.load_generation, target_ms)
         else:
             self._send_command(["seek", max(0, target_ms) / 1000.0, "absolute"])
 
@@ -264,6 +275,34 @@ class MpvController:
                 except Exception:
                     pass
 
+def execute_cmd_dict(controller, cmd_data):
+    action = cmd_data.get("action")
+    if action == "load":
+        controller.load_file(
+            cmd_data.get("file"),
+            start_ms=cmd_data.get("pos_ms", 0),
+            paused=cmd_data.get("paused", False)
+        )
+    elif action == "play":
+        controller.play()
+    elif action == "pause":
+        controller.pause()
+    elif action == "stop":
+        controller.stop()
+    elif action == "seek":
+        controller.seek(cmd_data.get("pos_ms", 0))
+    elif action == "speed":
+        controller.set_speed(cmd_data.get("speed", 1.0))
+    elif action == "loop":
+        controller.set_ab_loop(
+            cmd_data.get("loop_a_ms"),
+            cmd_data.get("loop_b_ms")
+        )
+    elif action == "quit":
+        controller.shutdown()
+        return False
+    return True
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: audio_backend.py <cache_dir>")
@@ -272,12 +311,14 @@ def main():
     cache_dir = sys.argv[1]
     os.makedirs(cache_dir, exist_ok=True)
     
+    cmds_dir = os.path.join(cache_dir, "cmds")
+    os.makedirs(cmds_dir, exist_ok=True)
+
     cmd_file = os.path.join(cache_dir, "audio_cmd.jsonl")
     proc_file = os.path.join(cache_dir, "audio_cmd.jsonl.proc")
     state_file = os.path.join(cache_dir, "audio_state.json")
     hb_file = os.path.join(cache_dir, "heartbeat.txt")
     
-    # Touch heartbeat
     try:
         with open(hb_file, "w", encoding="utf-8") as f:
             f.write(str(int(time.time() * 1000)))
@@ -297,7 +338,28 @@ def main():
         while controller.running:
             now = time.time()
             
-            # 1. Process incoming commands from JSONL queue atomically
+            # 1. Process atomic per-command files in cmds/ (in alphanumeric sorted order)
+            try:
+                cmd_files = sorted(f for f in os.listdir(cmds_dir) if f.endswith(".json"))
+                for cf in cmd_files:
+                    full_cf = os.path.join(cmds_dir, cf)
+                    try:
+                        with open(full_cf, "r", encoding="utf-8") as f:
+                            content = f.read().strip()
+                        os.remove(full_cf)
+                        if content:
+                            cmd_data = json.loads(content)
+                            if not execute_cmd_dict(controller, cmd_data):
+                                return
+                    except Exception:
+                        try:
+                            os.remove(full_cf)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # 2. Legacy JSONL queue processing
             if os.path.exists(cmd_file):
                 try:
                     os.replace(cmd_file, proc_file)
@@ -310,30 +372,7 @@ def main():
                                 cmd_data = json.loads(line)
                             except Exception:
                                 continue
-                            action = cmd_data.get("action")
-                            if action == "load":
-                                controller.load_file(
-                                    cmd_data.get("file"),
-                                    start_ms=cmd_data.get("pos_ms", 0),
-                                    paused=cmd_data.get("paused", False)
-                                )
-                            elif action == "play":
-                                controller.play()
-                            elif action == "pause":
-                                controller.pause()
-                            elif action == "stop":
-                                controller.stop()
-                            elif action == "seek":
-                                controller.seek(cmd_data.get("pos_ms", 0))
-                            elif action == "speed":
-                                controller.set_speed(cmd_data.get("speed", 1.0))
-                            elif action == "loop":
-                                controller.set_ab_loop(
-                                    cmd_data.get("loop_a_ms"),
-                                    cmd_data.get("loop_b_ms")
-                                )
-                            elif action == "quit":
-                                controller.shutdown()
+                            if not execute_cmd_dict(controller, cmd_data):
                                 return
                     try:
                         os.remove(proc_file)
@@ -342,14 +381,17 @@ def main():
                 except Exception:
                     pass
 
-            # 2. Poll time-pos if playing
+            # 3. Poll time-pos if playing
             if now - last_time_poll >= 0.035:
                 if controller.state["playing"] and not controller.state["paused"]:
                     controller.poll_time()
                 last_time_poll = now
 
-            # 3. Write atomic state to audio_state.json
+            # 4. Write atomic state to audio_state.json with instance_id and sequence counter
             if now - last_state_write >= 0.03:
+                controller.seq += 1
+                controller.state["seq"] = controller.seq
+                controller.state["instance_id"] = controller.instance_id
                 controller.state["heartbeat"] = int(now * 1000)
                 temp_state = state_file + ".tmp"
                 try:
@@ -360,13 +402,12 @@ def main():
                     pass
                 last_state_write = now
 
-            # 4. Check heartbeat watchdog every 0.5s
+            # 5. Check heartbeat watchdog every 0.5s
             if now - last_hb_check >= 0.5:
                 if os.path.exists(hb_file):
                     try:
                         mtime = os.path.getmtime(hb_file)
                         if now - mtime > 15.0:
-                            # Stale host -> exit cleanly
                             break
                     except Exception:
                         pass
