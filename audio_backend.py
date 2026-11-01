@@ -345,10 +345,14 @@ def main():
                     full_cf = os.path.join(cmds_dir, cf)
                     try:
                         with open(full_cf, "r", encoding="utf-8") as f:
-                            content = f.read().strip()
+                            raw = f.read()
+                        # A half-written file lacks the sentinel; leave it for the next tick
+                        if "__GSCORE_END__" not in raw:
+                            continue
                         os.remove(full_cf)
-                        if content:
-                            cmd_data = json.loads(content)
+                        cleaned = raw.replace("__GSCORE_END__", "").strip()
+                        if cleaned:
+                            cmd_data = json.loads(cleaned)
                             if not execute_cmd_dict(controller, cmd_data):
                                 return
                     except Exception:

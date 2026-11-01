@@ -6,7 +6,9 @@
 
 local SAMPLE = "D:/L/Guitar/吉他谱/Tears in Heaven.musicxml"
 local EXERCISES = "D:/L/AI/exercises"
+local PYTHON_EXE = "D:/programs/Python/python.exe"
 local REQUEST = tern.plugin.data .. "/open-request.json"
+local DRAFT_REQUEST = tern.plugin.data .. "/draft-request.json"
 local POLL_MS = 400
 
 local function scoreFiles(dir: string): { string }
@@ -25,49 +27,36 @@ end
 -- one column on the right of the focused pane, one row per score
 local mine: { number } = {}
 
+
 local function openList(cx: any, files: { string }, isDraft: boolean?)
 	if #files == 0 then
 		cx:toast("error", "No score files")
 		return
 	end
 	local previous = tern.kv.get("panes") or {}
-	local ours: { [number]: boolean } = {}
-	for _, id in ipairs(previous) do
-		ours[id] = true
-	end
-	-- anchor: the focused pane unless it is one we opened, else any pane we did not
+	mine = previous
+	-- anchor: the focused pane; scores and drafts are appended beside one another
+	-- so the original sheet and every draft stay open together for comparison.
 	local anchor = cx.session:focused()
-	if anchor == nil or ours[anchor] then
-		anchor = nil
+	if anchor == nil then
 		for _, info in cx.session:panes() do
-			if not ours[info.pane] then
-				anchor = info.pane
-				break
-			end
+			anchor = info.pane
+			break
 		end
 	end
 	if not anchor then
 		cx:toast("error", "No pane to split from")
 		return
 	end
-	-- refuse to pile up: a tab that already holds many panes is not a clean base
 	local count = 0
 	for _ in cx.session:panes() do
 		count = count + 1
 	end
-	if count > 12 then
+	if count > 16 then
 		cx:toast("warning", "Too many panes open", "close some, then retry")
 		return
 	end
-	for _, id in ipairs(previous) do
-		if id ~= anchor then
-			pcall(function()
-				cx.layout:close(id)
-			end)
-		end
-	end
-	tern.kv.set("panes", {})
-	mine = {}
+	tern.kv.set("panes", mine)
 	local a1 = { files[1] }
 	if isDraft then table.insert(a1, "draft") end
 	local column = cx.layout:split(anchor, "right", {
@@ -117,6 +106,51 @@ tern.bind("alt+shift+g", "plugin.gscore.open")
 
 -- agent channel -----------------------------------------------------------
 
+-- Draft executor: consume draft-request.json, run the generator, then open the
+-- produced MusicXML beside the source pane as a draft.
+local function runDraftRequest(cx: any)
+	local ok, text = pcall(tern.fs.read, DRAFT_REQUEST)
+	if not ok then
+		return
+	end
+	pcall(tern.fs.remove, DRAFT_REQUEST)
+	local okj, spec = pcall(tern.json.decode, text)
+	if not okj or type(spec) ~= "table" then
+		cx:toast("error", "Bad draft-request.json")
+		return
+	end
+	local selFile = spec.selection_file
+	local template = spec.template or "alternate_picking"
+	local bpm = tostring(spec.bpm or 60)
+	if type(selFile) ~= "string" or selFile == "" then
+		cx:toast("error", "Draft failed", "request has no selection_file")
+		return
+	end
+
+	local outPath = string.format("%s/drafts/draft_%s_%s.musicxml",
+		tern.plugin.data, tostring(spec.request_id or "req"), template)
+	pcall(tern.fs.mkdir, tern.plugin.data .. "/drafts")
+
+	cx:toast("info", "Generating draft…", template .. " @ " .. bpm .. " BPM")
+
+	tern.process.run({
+		PYTHON_EXE, tern.plugin.dir .. "/tools/generate_draft.py",
+		"--selection", selFile,
+		"--template", template,
+		"--bpm", bpm,
+		"--out", outPath,
+	}, { timeout_ms = 60000 }):next(function(res)
+		if not res or res.status ~= 0 or not tern.fs.exists(outPath) then
+			cx:toast("error", "Draft generation failed",
+				res and (res.stderr ~= "" and res.stderr or res.stdout) or "no output")
+			return
+		end
+		cx:toast("success", "Draft ready", template .. " · bars " ..
+			tostring((spec.bars or {})[1] or "?") .. "–" .. tostring((spec.bars or {})[2] or "?"))
+		openList(cx, { outPath }, true)
+	end)
+end
+
 local function consume(cx: any)
 	local ok, text = pcall(tern.fs.read, REQUEST)
 	if not ok then
@@ -145,8 +179,6 @@ local function consume(cx: any)
 		return
 	end
 	if spec.library then
-		pcall(tern.fs.write, tern.plugin.data .. "/win-debug.txt",
-			"library branch hit lib=" .. tostring(spec.library))
 		local dir = if type(spec.library) == "string" then spec.library else nil
 		-- reuse the library pane when it is still open
 		local old = tonumber(tern.kv.get("libraryPane") or 0)
@@ -160,8 +192,6 @@ local function consume(cx: any)
 			tern.kv.set("libraryPane", 0)
 		end
 		local anchor0 = cx.session:focused()
-		pcall(tern.fs.write, tern.plugin.data .. "/win-debug.txt",
-			"old=" .. tostring(old) .. " anchor=" .. tostring(anchor0))
 		if not anchor0 then
 			return
 		end
@@ -169,8 +199,6 @@ local function consume(cx: any)
 			block = "gscore.library",
 			args = if dir then { dir } else {},
 		})
-		pcall(tern.fs.write, tern.plugin.data .. "/win-debug.txt",
-			"old=" .. tostring(old) .. " anchor=" .. tostring(anchor0) .. " pane=" .. tostring(pane))
 		if pane then
 			tern.kv.set("libraryPane", pane)
 		end
@@ -187,6 +215,7 @@ end
 local function poll(cx: any)
 	if cx ~= nil then
 		pcall(consume, cx)
+		pcall(runDraftRequest, cx)
 	end
 	tern.timer(POLL_MS, poll)
 end

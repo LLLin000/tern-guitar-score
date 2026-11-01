@@ -1,63 +1,83 @@
 #!/usr/bin/env python3
-"""generate_draft.py — Agent tool to generate practice variations from selection.json.
+"""generate_draft.py — turn a structured selection into a practice variation.
 
-Transforms a selected score section into a standalone, playable MusicXML practice draft
-and optionally dispatches it to open beside the original in Tern.
+Consumes a `music_context_v1` selection (as written by the gscore panel) and emits a
+standalone guitar-TAB MusicXML draft. The note sounding pitch is always re-derived
+from tuning + fret, so a selection whose MIDI disagrees with its string/fret is
+rejected rather than silently generating an unplayable exercise.
 
 Usage:
-  python tools/generate_draft.py [options]
+  python tools/generate_draft.py --selection sel.json --template arpeggio --bpm 60 --open
 
-Options:
-  --selection PATH    Path to selection.json or draft-request.json
-                      (default: %LOCALAPPDATA%/Tern/plugin-data/gscore/selection.json)
-  --template TYPE     Variation type: 'alternate_picking', 'arpeggio', 'slow_drill'
-                      (default: 'alternate_picking')
-  --bpm BPM           Target practice tempo (default: 60)
-  --out PATH          Output .musicxml file path (default: in score cache or tools/)
-  --open              Notify Tern via open-request.json to open beside current pane
+Templates:
+  alternate_picking  eighth-note stream with explicit down/up stroke marks
+  arpeggio           p-i-m-a pattern with fingering marks
+  slow_drill         original rhythm with every duration doubled
 """
 
 import argparse
 import json
-import math
 import os
 import sys
 
+DIVISIONS = 4              # 1 quarter = 4 divisions
+QUARTER, EIGHTH, SIXTEENTH = 4, 2, 1
+
 MIDI_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+STANDARD_TUNING = [40, 45, 50, 55, 59, 64]   # string 1 (low E) .. string 6 (high E)
 
-def midi_to_step_octave_alter(midi):
-    pitch = int(midi)
-    octave = (pitch // 12) - 1
-    semitone = pitch % 12
-    name = MIDI_NOTE_NAMES[semitone]
+
+def midi_to_pitch(midi):
+    octave = (int(midi) // 12) - 1
+    name = MIDI_NOTE_NAMES[int(midi) % 12]
     if len(name) == 2:
-        step = name[0]
-        alter = 1
-    else:
-        step = name
-        alter = 0
-    return step, octave, alter
+        return name[0], octave, 1
+    return name, octave, 0
 
-def build_musicxml(title, bpm, time_sig, tuning_midi, measures_notes):
-    """
-    measures_notes: list of measures; each measure is a list of note dicts:
-      {
-        "string": int (1=high E .. 6=low E, or 1..6 guitar convention),
-        "fret": int,
-        "midi": int,
-        "duration": int (units in divisions=4, so 4=quarter, 2=eighth, 1=16th),
-        "type": "eighth" | "quarter" | "16th",
-        "voice": 1,
-        "chord": bool
-      }
-    """
-    ts_num, ts_den = time_sig if len(time_sig) >= 2 else (4, 4)
-    divisions = 4  # 1 quarter = 4 divisions; eighth = 2 divisions; 16th = 1 division
 
-    lines = [
+def note_midi(note, tuning):
+    """Sounding pitch from the tab position; falls back to the note's own midi."""
+    string = note.get("string")
+    fret = note.get("fret")
+    if isinstance(string, int) and isinstance(fret, int) and 1 <= string <= len(tuning):
+        return tuning[string - 1] + fret
+    return note.get("midi")
+
+
+def validate_selection(notes, tuning):
+    """Reject a selection whose declared MIDI contradicts its string/fret."""
+    problems = []
+    for n in notes:
+        string, fret, declared = n.get("string"), n.get("fret"), n.get("midi")
+        if not isinstance(string, int) or not isinstance(fret, int):
+            problems.append(f"note {n.get('id')} has no string/fret")
+            continue
+        if not 1 <= string <= len(tuning):
+            problems.append(f"note {n.get('id')} string {string} outside tuning")
+            continue
+        expected = tuning[string - 1] + fret
+        if isinstance(declared, int) and declared != expected:
+            problems.append(
+                f"note {n.get('id')}: string {string} fret {fret} implies midi {expected}, "
+                f"selection says {declared}"
+            )
+    return problems
+
+
+def bar_capacity(time_sig, unit):
+    """How many `unit`-sized slots fit in one bar of this time signature."""
+    num, den = (time_sig + [4, 4])[:2]
+    bar_in_quarters = num * (4.0 / den)
+    return max(1, int(round(bar_in_quarters * (QUARTER / unit))))
+
+
+def build_musicxml(title, bpm, time_sig, tuning, measures):
+    ts_num, ts_den = (time_sig + [4, 4])[:2]
+    out = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">',
-        f'<score-partwise version="4.0">',
+        '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
+        '"http://www.musicxml.org/dtds/partwise.dtd">',
+        '<score-partwise version="4.0">',
         f'  <work><work-title>{title}</work-title></work>',
         '  <part-list>',
         '    <score-part id="P1">',
@@ -69,208 +89,223 @@ def build_musicxml(title, bpm, time_sig, tuning_midi, measures_notes):
         '  <part id="P1">',
     ]
 
-    # Tuning lines: line 1 = string 6 (low E), line 6 = string 1 (high E)
-    # Default standard tuning: [40, 45, 50, 55, 59, 64]
-    tuning = tuning_midi if len(tuning_midi) >= 6 else [40, 45, 50, 55, 59, 64]
-
-    for m_idx, m_notes in enumerate(measures_notes, start=1):
-        lines.append(f'    <measure number="{m_idx}">')
+    for m_idx, notes in enumerate(measures, start=1):
+        out.append(f'    <measure number="{m_idx}">')
         if m_idx == 1:
-            lines.append('      <attributes>')
-            lines.append(f'        <divisions>{divisions}</divisions>')
-            lines.append('        <key><fifths>0</fifths></key>')
-            lines.append(f'        <time><beats>{ts_num}</beats><beat-type>{ts_den}</beat-type></time>')
-            lines.append('        <clef><sign>TAB</sign><line>5</line></clef>')
-            lines.append('        <staff-details>')
-            lines.append('          <staff-lines>6</staff-lines>')
-            for s_line in range(1, 7):
-                midi_val = tuning[s_line - 1]
-                step, octv, alt = midi_to_step_octave_alter(midi_val)
-                lines.append(f'          <staff-tuning line="{s_line}">')
-                lines.append(f'            <tuning-step>{step}</tuning-step>')
-                if alt != 0:
-                    lines.append(f'            <tuning-alter>{alt}</tuning-alter>')
-                lines.append(f'            <tuning-octave>{octv}</tuning-octave>')
-                lines.append('          </staff-tuning>')
-            lines.append('        </staff-details>')
-            lines.append('      </attributes>')
-            lines.append(f'      <direction placement="above"><sound tempo="{bpm}"/></direction>')
+            out.extend([
+                '      <attributes>',
+                f'        <divisions>{DIVISIONS}</divisions>',
+                '        <key><fifths>0</fifths></key>',
+                f'        <time><beats>{ts_num}</beats><beat-type>{ts_den}</beat-type></time>',
+                '        <clef><sign>TAB</sign><line>5</line></clef>',
+                '        <staff-details>',
+                '          <staff-lines>6</staff-lines>',
+            ])
+            for line in range(1, 7):
+                step, octv, alt = midi_to_pitch(tuning[line - 1])
+                out.append(f'          <staff-tuning line="{line}">')
+                out.append(f'            <tuning-step>{step}</tuning-step>')
+                if alt:
+                    out.append(f'            <tuning-alter>{alt}</tuning-alter>')
+                out.append(f'            <tuning-octave>{octv}</tuning-octave>')
+                out.append('          </staff-tuning>')
+            out.extend([
+                '        </staff-details>',
+                '      </attributes>',
+                f'      <direction placement="above"><sound tempo="{bpm}"/></direction>',
+            ])
 
-        for note in m_notes:
-            step, octv, alt = midi_to_step_octave_alter(note["midi"])
-            dur = note.get("duration", 2)
-            ntype = note.get("type", "eighth")
-            lines.append('      <note>')
+        for note in notes:
+            midi = note["midi"]
+            step, octv, alt = midi_to_pitch(midi)
+            out.append('      <note>')
             if note.get("chord"):
-                lines.append('        <chord/>')
-            lines.append('        <pitch>')
-            lines.append(f'          <step>{step}</step>')
-            if alt != 0:
-                lines.append(f'          <alter>{alt}</alter>')
-            lines.append(f'          <octave>{octv}</octave>')
-            lines.append('        </pitch>')
-            lines.append(f'        <duration>{dur}</duration>')
-            lines.append('        <voice>1</voice>')
-            lines.append(f'        <type>{ntype}</type>')
-            lines.append('        <notations>')
-            lines.append('          <technical>')
-            # alphaTab string index: 1 = lowest (line 1), 6 = highest (line 6)
-            s_num = note.get("string", 1)
-            # In MusicXML tab notation, string 1 is highest E, 6 is lowest E
-            # Convert alphaTab internal (1=low, 6=high) -> MusicXML (6=low, 1=high)
-            xml_string = (7 - s_num) if (1 <= s_num <= 6) else s_num
-            lines.append(f'            <string>{xml_string}</string>')
-            lines.append(f'            <fret>{note.get("fret", 0)}</fret>')
-            lines.append('          </technical>')
-            lines.append('        </notations>')
-            lines.append('      </note>')
+                out.append('        <chord/>')
+            out.append('        <pitch>')
+            out.append(f'          <step>{step}</step>')
+            if alt:
+                out.append(f'          <alter>{alt}</alter>')
+            out.append(f'          <octave>{octv}</octave>')
+            out.append('        </pitch>')
+            out.append(f'        <duration>{note["duration"]}</duration>')
+            out.append('        <voice>1</voice>')
+            out.append(f'        <type>{note["type"]}</type>')
+            # stick direction / fingering ride on <notations>
+            marks = []
+            if note.get("stroke"):
+                marks.append(f'          <technical><{note["stroke"]}/></technical>')
+            if note.get("finger"):
+                marks.append(f'          <technical><fingering>{note["finger"]}</fingering></technical>')
+            for m in marks:
+                out.append('        <notations>')
+                out.append(m)
+                out.append('        </notations>')
+            # tab position: alphaTab numbers strings 1=lowest .. 6=highest,
+            # MusicXML numbers 1=highest .. 6=lowest
+            xml_string = 7 - note["string"] if 1 <= note["string"] <= 6 else note["string"]
+            out.append('        <notations>')
+            out.append('          <technical>')
+            out.append(f'            <string>{xml_string}</string>')
+            out.append(f'            <fret>{note["fret"]}</fret>')
+            out.append('          </technical>')
+            out.append('        </notations>')
+            out.append('      </note>')
 
-        lines.append('    </measure>')
+        out.append('    </measure>')
 
-    lines.append('  </part>')
-    lines.append('</score-partwise>')
-    return "\n".join(lines) + "\n"
+    out.extend(['  </part>', '</score-partwise>'])
+    return "\n".join(out) + "\n"
 
-def transform_selection(data, template="alternate_picking", target_bpm=60):
-    notes = data.get("notes", [])
-    if not notes:
-        # Fallback to a basic chromatic crawl if selection has no notes
-        notes = [{"bar": 0, "string": s, "fret": f, "midi": 40 + s * 5 + f}
-                 for s in range(1, 7) for f in range(1, 5)]
 
-    time_sig = data.get("time_signature", [4, 4])
-    tuning = data.get("tuning_midi", [40, 45, 50, 55, 59, 64])
-    title = f"{data.get('title', 'Exercise')} [Draft: {template.replace('_', ' ').title()}]"
+def transform(data, template, target_bpm):
+    raw_tuning = data.get("tuning_midi") or STANDARD_TUNING
+    if len(raw_tuning) < 6:
+        raw_tuning = STANDARD_TUNING
+    # Normalize tuning to low-to-high order [low E, A, D, G, B, high E]
+    # alphaTab's raw array is high-to-low [64, 59, 55, 50, 45, 40]
+    if raw_tuning[0] > raw_tuning[-1]:
+        tuning = list(reversed(raw_tuning))
+    else:
+        tuning = list(raw_tuning)
+    time_sig = data.get("time_signature") or [4, 4]
+    source_notes = data.get("notes") or []
 
-    # Group original notes by bar
+    if not source_notes:
+        raise SystemExit(
+            "selection has no notes: refusing to invent an unrelated exercise"
+        )
+
+    problems = validate_selection(source_notes, tuning)
+    if problems:
+        raise SystemExit("selection rejected:\n  " + "\n  ".join(problems[:8]))
+
     by_bar = {}
-    for n in notes:
+    for n in source_notes:
         by_bar.setdefault(n.get("bar", 0), []).append(n)
+    bars = sorted(by_bar)
 
+    base_title = data.get("title") or "Exercise"
+    title = f"{base_title} [Draft: {template.replace('_', ' ').title()}]"
     measures = []
 
     if template == "alternate_picking":
-        # Create an eighth-note alternate picking study across the strings present in selection
-        unique_bars = sorted(by_bar.keys())
-        for b in unique_bars:
-            src_notes = by_bar[b]
-            m_notes = []
-            # 8 eighth notes per 4/4 bar
-            count = 8
-            for i in range(count):
-                src = src_notes[i % len(src_notes)]
-                m_notes.append({
-                    "string": src["string"],
-                    "fret": src["fret"],
-                    "midi": src["midi"],
-                    "duration": 2,  # eighth
+        slots = bar_capacity(time_sig, EIGHTH)
+        for b in bars:
+            src = by_bar[b]
+            measure = []
+            for i in range(slots):
+                note = dict(src[i % len(src)])
+                measure.append({
+                    "string": note["string"],
+                    "fret": note["fret"],
+                    "midi": note_midi(note, tuning),
+                    "duration": EIGHTH,
                     "type": "eighth",
+                    "stroke": "down-bow" if i % 2 == 0 else "up-bow",
                 })
-            measures.append(m_notes)
+            measures.append(measure)
 
     elif template == "arpeggio":
-        # Create classical P-I-M-A arpeggio patterns from selected pitch sets
-        unique_bars = sorted(by_bar.keys())
-        for b in unique_bars:
-            src_notes = by_bar[b]
-            # Sort by string ascending (low to high)
-            sorted_notes = sorted(src_notes, key=lambda n: n["string"])
-            m_notes = []
-            for i in range(8):
-                # Cycle bass -> treble -> bass -> treble
-                pattern_idx = [0, 1, 2, 1, 3, 2, 1, 2][i % 8]
-                src = sorted_notes[pattern_idx % len(sorted_notes)]
-                m_notes.append({
-                    "string": src["string"],
-                    "fret": src["fret"],
-                    "midi": src["midi"],
-                    "duration": 2,
+        slots = bar_capacity(time_sig, EIGHTH)
+        fingering = ["p", "i", "m", "a"]
+        for b in bars:
+            src = sorted(by_bar[b], key=lambda n: n["string"])
+            measure = []
+            for i in range(slots):
+                note = dict(src[[0, 1, 2, 1][i % 4] % len(src)])
+                measure.append({
+                    "string": note["string"],
+                    "fret": note["fret"],
+                    "midi": note_midi(note, tuning),
+                    "duration": EIGHTH,
                     "type": "eighth",
+                    "finger": fingering[i % 4],
                 })
-            measures.append(m_notes)
+            measures.append(measure)
 
     elif template == "slow_drill":
-        # Keep original sequence but double the duration (quarter notes at half tempo)
-        unique_bars = sorted(by_bar.keys())
-        for b in unique_bars:
-            src_notes = by_bar[b]
-            m_notes = []
-            # 4 quarter notes per bar
-            for i in range(4):
-                src = src_notes[i % len(src_notes)]
-                m_notes.append({
-                    "string": src["string"],
-                    "fret": src["fret"],
-                    "midi": src["midi"],
-                    "duration": 4,  # quarter
-                    "type": "quarter",
+        # keep the original order and simply double every duration
+        for b in bars:
+            measure = []
+            for note in by_bar[b]:
+                doubled = min(QUARTER, (note.get("duration_ticks") or 240) // 120)
+                dur = doubled if doubled in (1, 2, 4) else EIGHTH
+                measure.append({
+                    "string": note["string"],
+                    "fret": note["fret"],
+                    "midi": note_midi(note, tuning),
+                    "duration": dur * 2 if dur * 2 <= QUARTER * 2 else QUARTER,
+                    "type": {1: "16th", 2: "eighth", 4: "quarter"}.get(dur, "eighth"),
                 })
-            measures.append(m_notes)
+            measures.append(measure)
 
-    xml_text = build_musicxml(title, target_bpm, time_sig, tuning, measures)
-    return xml_text, title
+    else:
+        raise SystemExit(f"unknown template: {template}")
+
+    return build_musicxml(title, target_bpm, time_sig, tuning, measures), title
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate practice variation MusicXML from selection")
-    parser.add_argument("--selection", help="Path to selection.json or draft-request.json")
-    parser.add_argument("--template", choices=["alternate_picking", "arpeggio", "slow_drill"], default="alternate_picking")
-    parser.add_argument("--bpm", type=int, default=60)
-    parser.add_argument("--out", help="Output .musicxml file path")
-    parser.add_argument("--open", action="store_true", help="Send open-request.json to Tern")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Generate a practice variation from a gscore selection")
+    ap.add_argument("--selection", help="selection.json or draft-request.json")
+    ap.add_argument("--template", default="alternate_picking",
+                    choices=["alternate_picking", "arpeggio", "slow_drill"])
+    ap.add_argument("--bpm", type=int, default=60)
+    ap.add_argument("--out", help="output .musicxml path")
+    ap.add_argument("--open", action="store_true", help="ask Tern to open it beside the source pane")
+    args = ap.parse_args()
 
-    # Locate selection file
-    default_plugin_data = os.path.expandvars(r"%LOCALAPPDATA%\Tern\plugin-data\gscore")
-    sel_path = args.selection
-    if not sel_path:
-        sel_candidate = os.path.join(default_plugin_data, "selection.json")
-        req_candidate = os.path.join(default_plugin_data, "draft-request.json")
-        if os.path.exists(req_candidate):
-            sel_path = req_candidate
-        elif os.path.exists(sel_candidate):
-            sel_path = sel_candidate
+    plugin_data = os.path.expandvars(r"%LOCALAPPDATA%\Tern\plugin-data\gscore")
+    sel = args.selection
+    if not sel:
+        for candidate in ("draft-request.json", "selection.json"):
+            p = os.path.join(plugin_data, candidate)
+            if os.path.exists(p):
+                sel = p
+                break
+    if not sel or not os.path.exists(sel):
+        raise SystemExit(f"selection file not found: {sel}")
 
-    if not sel_path or not os.path.exists(sel_path):
-        print(f"Error: selection file not found (tried {sel_path})", file=sys.stderr)
-        sys.exit(1)
-
-    with open(sel_path, "r", encoding="utf-8") as f:
+    with open(sel, encoding="utf-8") as f:
         data = json.load(f)
 
-    # If it was a draft-request wrapper, read the referenced selection
-    if data.get("action") == "create_draft" and "selection_file" in data:
-        sub_sel = data["selection_file"]
-        if os.path.exists(sub_sel):
-            with open(sub_sel, "r", encoding="utf-8") as sf:
-                data = json.load(sf)
+    # a draft-request carries a pointer to the exported selection
+    if data.get("action") == "create_draft":
+        pointed = data.get("selection_file")
+        if not pointed or not os.path.exists(pointed):
+            raise SystemExit("draft-request has no readable selection_file")
+        with open(pointed, encoding="utf-8") as f:
+            data = json.load(f)
+        template = data.get("_template") or args.template
+        template = data.get("template", template)
+    else:
+        template = args.template
 
-    xml_text, title = transform_selection(data, template=args.template, target_bpm=args.bpm)
+    xml_text, title = transform(data, template, args.bpm)
 
-    # Output path
-    out_path = args.out
-    if not out_path:
-        src_path = data.get("path", "draft")
-        src_name = os.path.splitext(os.path.basename(src_path))[0]
-        out_dir = os.path.join(default_plugin_data, "drafts")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"draft_{src_name}_{args.template}.musicxml")
+    out = args.out
+    if not out:
+        stem = os.path.splitext(os.path.basename(data.get("path") or "score"))[0]
+        drafts = os.path.join(plugin_data, "drafts")
+        os.makedirs(drafts, exist_ok=True)
+        out = os.path.join(drafts, f"draft_{stem}_{template}.musicxml")
 
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
         f.write(xml_text)
-    print(f"Draft generated successfully: {out_path}")
-    print(f"  Title: {title}")
-    print(f"  Bars: {len(data.get('bars', [0, 0]))} ({args.template} @ {args.bpm} BPM)")
+
+    note_count = sum(1 for line in xml_text.splitlines() if "<fret>" in line)
+    print(f"draft written: {out}")
+    print(f"  title: {title}")
+    print(f"  template: {template} @ {args.bpm} BPM")
+    print(f"  notes: {note_count}")
 
     if args.open:
-        req_file = os.path.join(default_plugin_data, "open-request.json")
-        payload = {
-            "file": os.path.abspath(out_path).replace("\\", "/"),
-            "draft": True
-        }
-        with open(req_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        print(f"Dispatched open-request to Tern for {out_path}")
+        req = os.path.join(plugin_data, "open-request.json")
+        with open(req, "w", encoding="utf-8") as f:
+            json.dump({"file": os.path.abspath(out).replace("\\", "/"), "draft": True}, f)
+        print(f"  opened beside the source pane")
+
 
 if __name__ == "__main__":
     main()

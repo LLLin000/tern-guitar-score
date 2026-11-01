@@ -84,6 +84,7 @@ type Score = {
 	lastBackendActiveAt: number?,
 	lastActiveSys: number?,
 	isDraft: boolean,
+	draftTemplate: string?,
 	tuning: { number },
 	timeSignature: { number },
 	cur: { [number]: boolean },
@@ -161,9 +162,9 @@ end
 local OPEN = { [1] = 40, [2] = 45, [3] = 50, [4] = 55, [5] = 59, [6] = 64 }
 
 -- the agent reads this: the selected bars as notes, timing and tuning
-local function exportSelection(sc: Score)
+local function exportSelection(sc: Score, destPath: string?): any
 	if sc.selA == nil then
-		return
+		return nil
 	end
 	local lo = sc.selA
 	local hi = sc.selB or sc.selA
@@ -171,7 +172,13 @@ local function exportSelection(sc: Score)
 	for _, sys in ipairs(sc.systems) do
 		for _, n in ipairs(sys.notes) do
 			if n.m >= lo and n.m <= hi then
-				local baseMidi = (sc.tuning and #sc.tuning >= n.string) and sc.tuning[n.string] or (OPEN[n.string] or 0)
+				local tuningLen = if sc.tuning then #sc.tuning else 0
+				local baseMidi = OPEN[n.string] or 40
+				-- sc.tuning from alphaTab is high-to-low [64, 59, 55, 50, 45, 40]
+				-- n.string is low-to-high (1 = low E, 6 = high E)
+				if tuningLen >= 6 and n.string >= 1 and n.string <= 6 then
+					baseMidi = sc.tuning[7 - n.string] or baseMidi
+				end
 				table.insert(notes, {
 					id = n.id,
 					bar = n.m,
@@ -215,7 +222,9 @@ local function exportSelection(sc: Score)
 		notes = notes,
 		beats = beats,
 	}
-	pcall(tern.fs.write, tern.plugin.data .. "/selection.json", tern.json.encode(payload, true))
+	local encoded = tern.json.encode(payload, true)
+	pcall(tern.fs.write, destPath or (tern.plugin.data .. "/selection.json"), encoded)
+	return payload
 end
 
 local function loopRange(sc: Score): (number, number)
@@ -261,10 +270,15 @@ local function stateFile(sc: Score): string
 	return sc.out .. "/audio_state.json"
 end
 
+-- Luau has no rename, so publish atomically with an end sentinel: the reader
+-- only consumes a file whose body terminates with END_SENTINEL, which a
+-- half-written file never does.
+local END_SENTINEL = "\n__GSCORE_END__\n"
+
 local function sendCmd(sc: Score, payload: any)
 	sc.cmdSeq = (sc.cmdSeq or 0) + 1
 	local path = string.format("%s/%08d.json", cmdsDir(sc), sc.cmdSeq)
-	pcall(tern.fs.write, path, tern.json.encode(payload, false))
+	pcall(tern.fs.write, path, tern.json.encode(payload, false) .. END_SENTINEL)
 end
 
 -- self-healing backend watcher: relies on strictly monotonic sequence numbers
@@ -682,6 +696,7 @@ local def: BlockDef<State> = {
 				lastBackendActiveAt = nil,
 				lastActiveSys = nil,
 				isDraft = isDraft,
+				draftTemplate = nil,
 				tuning = {},
 				timeSignature = { 4, 4 },
 				cur = {},
@@ -854,20 +869,33 @@ local def: BlockDef<State> = {
 		end
 		if act == "agent_draft" then
 			local sc0 = state.scores[state.active]
-			if sc0 and sc0.selA ~= nil then
-				exportSelection(sc0)
-				local reqPayload = {
-					action = "create_draft",
-					source_score = sc0.path,
-					title = sc0.title,
-					bars = { sc0.selA, sc0.selB or sc0.selA },
-					t0 = sc0.selT0,
-					t1 = sc0.selT1,
-					created_at = math.floor(tern.now()),
-				}
-				pcall(tern.fs.write, tern.plugin.data .. "/draft-request.json", tern.json.encode(reqPayload, true))
-				cx:toast("info", "Draft requested", "Bars " .. tostring(sc0.selA) .. "–" .. tostring(sc0.selB or sc0.selA) .. " exported for Agent")
+			if sc0 == nil or sc0.selA == nil then
+				cx:toast("warning", "Select some bars first", "Click a bar, Shift-click to extend")
+				return
 			end
+			local requestId = string.format("req_%d_%d", math.floor(tern.now()), math.random(100000))
+			local draftsDir = tern.plugin.data .. "/drafts"
+			pcall(tern.fs.mkdir, draftsDir)
+			local selFile = draftsDir .. "/selection_" .. requestId .. ".json"
+			-- keep a per-request snapshot so the generator never reads a newer selection
+			exportSelection(sc0, selFile)
+			local reqPayload = {
+				action = "create_draft",
+				request_id = requestId,
+				selection_file = selFile,
+				source_score = sc0.path,
+				source_pane = cx.pane,
+				title = sc0.title,
+				bars = { sc0.selA, sc0.selB or sc0.selA },
+				t0 = sc0.selT0,
+				t1 = sc0.selT1,
+				template = sc0.draftTemplate or "alternate_picking",
+				bpm = 60,
+				created_at = math.floor(tern.now()),
+			}
+			pcall(tern.fs.write, tern.plugin.data .. "/draft-request.json", tern.json.encode(reqPayload, true))
+			cx:toast("info", "Draft requested",
+				"Bars " .. tostring(sc0.selA) .. "–" .. tostring(sc0.selB or sc0.selA) .. " · " .. tostring(sc0.draftTemplate or "alternate_picking"))
 			return
 		end
 		if act == "playpause" or act == "stop" or act == "home" or act == "back"

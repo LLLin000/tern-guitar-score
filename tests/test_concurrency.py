@@ -38,7 +38,7 @@ def count_mpv():
 def write_cmd(cmds_dir, seq, payload):
     path = os.path.join(cmds_dir, f"{seq:08d}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
+        f.write(json.dumps(payload) + "\n__GSCORE_END__\n")
 
 def read_state(state_file):
     with open(state_file, "r", encoding="utf-8") as f:

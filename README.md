@@ -58,11 +58,18 @@ The companion turns selected measures into practice variations that open side by
 
 1. **Select measures**: Click or Shift-click measures on any score pane.
 2. **Request draft**:
-   - In UI: Click the **wand button (`🪄`)** on the toolbar to export selection and request a draft.
-   - Via CLI: Run `python tools/generate_draft.py --open` to create and open a variation immediately.
-3. **Practice & compare**:
+   - **In UI**: Click the **wand button (`🪄`)** on the toolbar. It writes a structured `draft-request.json` (with `selection_file`, `source_pane`, `request_id`, `bars`, `template`, `bpm`), which `window.luau`'s background executor automatically picks up, generates via `tools/generate_draft.py`, and opens beside the original score.
+   - **Via CLI / Agent**: Run `python tools/generate_draft.py --open` to create and open a variation immediately.
+3. **Musical semantics & validation**:
+   - Sounding pitch is strictly validated against `expected_midi = tuning[string - 1] + fret`. Incoherent notes are rejected, not silently invented.
+   - Empty selections are rejected rather than falling back to unrelated exercises.
+   - `alternate_picking`: writes MusicXML `<down-bow/>` and `<up-bow/>` stroke direction notations according to time signature capacity.
+   - `arpeggio`: annotates classical right-hand fingerings (`p`, `i`, `m`, `a`).
+   - `slow_drill`: preserves source rhythm while doubling note durations for motor placement.
+4. **Practice & compare**:
    - The variation opens as a split pane beside the original score labeled `[Draft]`.
-   - Both original and draft can be independently played, looped, and auditioned.
+   - Existing panes are preserved (never closed) so original and variations stay side by side.
+   - Both original and drafts can be independently played, looped, auditioned, or modified.
 
 ```bash
 # Generate an alternate-picking study at 60 BPM and open beside the original
