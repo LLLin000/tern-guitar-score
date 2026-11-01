@@ -143,11 +143,12 @@ local function exportSelection(sc: Score)
 	for _, sys in ipairs(sc.systems) do
 		for _, n in ipairs(sys.notes) do
 			if n.m >= lo and n.m <= hi then
+				local baseMidi = (sc.tuning and #sc.tuning >= n.string) and sc.tuning[n.string] or (OPEN[n.string] or 0)
 				table.insert(notes, {
 					bar = n.m,
 					string = n.string,
 					fret = n.fret,
-					midi = (OPEN[n.string] or 0) + (n.fret or 0),
+					midi = baseMidi + (n.fret or 0),
 				})
 			end
 		end
@@ -776,6 +777,115 @@ tern.block.define("score", def)
 
 -- library ---------------------------------------------------------------
 
+-- formats alphaTab's ScoreLoader imports; keep the manifest's file globs in step
+local EXTS = { "musicxml", "xml", "mxl", "gp", "gp3", "gp4", "gp5", "gpx" }
+local START_DIR = "D:/L/Guitar/吉他谱"
+
+type Entry = { path: string, name: string, isDir: boolean, title: string? }
+
+local function isScore(name: string): boolean
+	for _, ext in ipairs(EXTS) do
+		if name:lower():sub(-#ext - 1) == "." .. ext then
+			return true
+		end
+	end
+	return false
+end
+
+local function titleOf(path: string): string?
+	local ok, text = pcall(tern.fs.read, path, 65536)
+	if not ok then
+		return nil
+	end
+	return string.match(text, "<movement%-title[^>]*>([^<]+)<")
+		or string.match(text, "<work%-title[^>]*>([^<]+)<")
+end
+
+local function isDir(path: string): boolean
+	local ok = pcall(tern.fs.list, path)
+	return ok
+end
+
+local function byName(a: Entry, b: Entry): boolean
+	return a.name:lower() < b.name:lower()
+end
+
+local function scan(dir: string): ({ Entry }, string?)
+	local ok, names = pcall(tern.fs.list, dir)
+	if not ok then
+		return {}, "cannot read " .. dir
+	end
+	local dirs: { Entry } = {}
+	local files: { Entry } = {}
+	for _, name in ipairs(names) do
+		if name:sub(1, 1) ~= "." then
+			local path = dir .. "/" .. name
+			if isDir(path) then
+				table.insert(dirs, { path = path, name = name, isDir = true })
+			elseif isScore(name) then
+				table.insert(files, { path = path, name = name, isDir = false, title = titleOf(path) })
+			end
+		end
+	end
+	table.sort(dirs, byName)
+	table.sort(files, byName)
+	local out = dirs
+	for _, f in ipairs(files) do
+		table.insert(out, f)
+	end
+	return out, nil
+end
+
+local function parentOf(path: string): string
+	local up = string.match(path, "^(.*)[/\\][^/\\]+$")
+	if up == nil or up == "" then
+		return path
+	end
+	if up:match("^%a:$") then
+		return up .. "/"
+	end
+	return up
+end
+
+local function sheet(state: LibState): Node
+	local items = {}
+	local order = {}
+	for _, e in ipairs(state.entries) do
+		local id = e.path
+		table.insert(items, {
+			id = id,
+			label = if e.isDir then { ui.span("▸ " .. e.name) } else { ui.span(e.title or e.name) },
+			detail = if e.isDir then { ui.span(e.path, "dim") } else { ui.span(e.name, "dim") },
+			icon = if e.isDir then "folder" else "music",
+		})
+		table.insert(order, id)
+	end
+	local sel = order[math.max(1, math.min(state.sel, #order))]
+	return ui.node("picker", {
+		title = { ui.span("Open a score") },
+		subtitle = { ui.span(state.cwd, "dim") },
+		noun = "scores",
+		icon = "music",
+		size = "md",
+		layout = "rows",
+		preview = "none",
+		query = state.query,
+		placeholder = "Search scores…",
+		state = "ready",
+		message = state.err,
+		items = items,
+		order = order,
+		selected = sel,
+		actions = {
+			{ id = "open", label = "Open", keys = { "return" }, primary = true },
+			{ id = "up", label = "Up" },
+			{ id = "close", label = "Cancel", keys = { "escape" } },
+		},
+	})
+end
+
+
+
 type LibState = {
 	open: boolean,
 	cwd: string,
@@ -785,13 +895,27 @@ type LibState = {
 	stale: { string },
 }
 
+local function hitsOf(text: string, query: string): boolean
+	local low = text:lower()
+	local q = query:lower()
+	if q == "" then return true end
+	local at = 1
+	for i = 1, #q do
+		local ch = q:sub(i, i)
+		local found = string.find(low, ch, at, true)
+		if not found then return false end
+		at = found + 1
+	end
+	return true
+end
+
 local function shown(state: LibState): { Entry }
 	if state.query == "" then
 		return state.entries
 	end
 	local out = {}
 	for _, e in ipairs(state.entries) do
-		if hits(e.name, state.query) or hits(e.title or "", state.query) then
+		if hitsOf(e.name, state.query) or hitsOf(e.title or "", state.query) then
 			table.insert(out, e)
 		end
 	end
