@@ -11,8 +11,8 @@ Usage:
 
 Templates:
   alternate_picking  eighth-note stream with explicit down/up stroke marks
-  arpeggio           p-i-m-a pattern with fingering marks
-  slow_drill         original rhythm with every duration doubled
+  arpeggio           p-i-m-a plucking marks
+  slow_drill         source rhythm at the requested slower tempo
 """
 
 import argparse
@@ -20,8 +20,13 @@ import json
 import os
 import sys
 
-DIVISIONS = 4              # 1 quarter = 4 divisions
-QUARTER, EIGHTH, SIXTEENTH = 4, 2, 1
+DIVISIONS = 960          # alphaTab playback ticks per quarter note
+QUARTER, EIGHTH, SIXTEENTH = DIVISIONS, DIVISIONS // 2, DIVISIONS // 4
+NOTE_TYPE_TICKS = {
+    "whole": 4 * DIVISIONS, "half": 2 * DIVISIONS, "quarter": DIVISIONS,
+    "eighth": DIVISIONS // 2, "16th": DIVISIONS // 4, "32nd": DIVISIONS // 8,
+    "64th": DIVISIONS // 16, "128th": DIVISIONS // 32, "256th": DIVISIONS // 64,
+}
 
 MIDI_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 STANDARD_TUNING = [40, 45, 50, 55, 59, 64]   # string 1 (low E) .. string 6 (high E)
@@ -33,6 +38,38 @@ def midi_to_pitch(midi):
     if len(name) == 2:
         return name[0], octave, 1
     return name, octave, 0
+
+
+def rhythmic_notation(note):
+    """Preserve an alphaTab beat duration as MusicXML duration/type/dots/tuplet."""
+    duration = note.get("duration_ticks")
+    if not isinstance(duration, int) or duration <= 0:
+        duration = EIGHTH
+    dots = note.get("dots") or 0
+    if not isinstance(dots, int) or not 0 <= dots <= 3:
+        raise SystemExit(f"unsupported dot count: {dots}")
+
+    actual = normal = 1
+    tuplet = note.get("tuplet")
+    if tuplet:
+        try:
+            actual, normal = (int(value) for value in str(tuplet).split(":"))
+        except (TypeError, ValueError):
+            raise SystemExit(f"invalid tuplet ratio: {tuplet}")
+        if actual <= 0 or normal <= 0:
+            raise SystemExit(f"invalid tuplet ratio: {tuplet}")
+
+    dot_numerator = (1 << (dots + 1)) - 1
+    dot_denominator = 1 << dots
+    base_numerator = duration * actual * dot_denominator
+    base_denominator = normal * dot_numerator
+    for note_type, base_ticks in NOTE_TYPE_TICKS.items():
+        if base_numerator == base_ticks * base_denominator:
+            time_modification = (actual, normal) if tuplet else None
+            return duration, note_type, dots, time_modification
+    raise SystemExit(
+        f"unsupported source rhythm: {duration} ticks, {dots} dots, tuplet {tuplet}"
+    )
 
 
 def note_midi(note, tuning):
@@ -116,39 +153,48 @@ def build_musicxml(title, bpm, time_sig, tuning, measures):
             ])
 
         for note in notes:
-            midi = note["midi"]
-            step, octv, alt = midi_to_pitch(midi)
             out.append('      <note>')
-            if note.get("chord"):
-                out.append('        <chord/>')
-            out.append('        <pitch>')
-            out.append(f'          <step>{step}</step>')
-            if alt:
-                out.append(f'          <alter>{alt}</alter>')
-            out.append(f'          <octave>{octv}</octave>')
-            out.append('        </pitch>')
+            if note.get("rest"):
+                out.append('        <rest/>')
+            else:
+                if note.get("chord"):
+                    out.append('        <chord/>')
+                midi = note["midi"]
+                step, octv, alt = midi_to_pitch(midi)
+                out.append('        <pitch>')
+                out.append(f'          <step>{step}</step>')
+                if alt:
+                    out.append(f'          <alter>{alt}</alter>')
+                out.append(f'          <octave>{octv}</octave>')
+                out.append('        </pitch>')
             out.append(f'        <duration>{note["duration"]}</duration>')
             out.append('        <voice>1</voice>')
             out.append(f'        <type>{note["type"]}</type>')
-            # stick direction / fingering ride on <notations>
-            marks = []
+            for _ in range(note.get("dots", 0)):
+                out.append('        <dot/>')
+            if note.get("time_modification"):
+                actual, normal = note["time_modification"]
+                out.extend([
+                    '        <time-modification>',
+                    f'          <actual-notes>{actual}</actual-notes>',
+                    f'          <normal-notes>{normal}</normal-notes>',
+                    '        </time-modification>',
+                ])
+            technical = []
             if note.get("stroke"):
-                marks.append(f'          <technical><{note["stroke"]}/></technical>')
+                technical.append(f'<{note["stroke"]}/>')
             if note.get("finger"):
-                marks.append(f'          <technical><fingering>{note["finger"]}</fingering></technical>')
-            for m in marks:
+                technical.append(f'<pluck>{note["finger"]}</pluck>')
+            if not note.get("rest"):
+                xml_string = 7 - note["string"] if 1 <= note["string"] <= 6 else note["string"]
+                technical.extend([
+                    f'<string>{xml_string}</string>',
+                    f'<fret>{note["fret"]}</fret>',
+                ])
+            if technical:
                 out.append('        <notations>')
-                out.append(m)
+                out.append('          <technical>' + ''.join(technical) + '</technical>')
                 out.append('        </notations>')
-            # tab position: alphaTab numbers strings 1=lowest .. 6=highest,
-            # MusicXML numbers 1=highest .. 6=lowest
-            xml_string = 7 - note["string"] if 1 <= note["string"] <= 6 else note["string"]
-            out.append('        <notations>')
-            out.append('          <technical>')
-            out.append(f'            <string>{xml_string}</string>')
-            out.append(f'            <fret>{note["fret"]}</fret>')
-            out.append('          </technical>')
-            out.append('        </notations>')
             out.append('      </note>')
 
         out.append('    </measure>')
@@ -224,19 +270,56 @@ def transform(data, template, target_bpm):
             measures.append(measure)
 
     elif template == "slow_drill":
-        # keep the original order and simply double every duration
+        beat_events = {}
+        for event in data.get("beats") or []:
+            bar = event.get("bar")
+            if bar in by_bar:
+                for beat_id in event.get("beat_ids") or []:
+                    beat_events.setdefault(bar, {}).setdefault(beat_id, event)
         for b in bars:
             measure = []
+            events = beat_events.get(b)
+            if not events:
+                events = {
+                    note.get("beat", note.get("id", i)): {
+                        "duration_ticks": note.get("duration_ticks"),
+                        "dots": note.get("dots", 0),
+                        "tuplet": note.get("tuplet"),
+                    }
+                    for i, note in enumerate(by_bar[b])
+                }
+            notes_by_beat = {}
             for note in by_bar[b]:
-                doubled = min(QUARTER, (note.get("duration_ticks") or 240) // 120)
-                dur = doubled if doubled in (1, 2, 4) else EIGHTH
-                measure.append({
-                    "string": note["string"],
-                    "fret": note["fret"],
-                    "midi": note_midi(note, tuning),
-                    "duration": dur * 2 if dur * 2 <= QUARTER * 2 else QUARTER,
-                    "type": {1: "16th", 2: "eighth", 4: "quarter"}.get(dur, "eighth"),
-                })
+                notes_by_beat.setdefault(note.get("beat", note.get("id")), []).append(note)
+            for beat_id, event in sorted(
+                events.items(), key=lambda item: (item[1].get("tick", 0), item[0])
+            ):
+                group = notes_by_beat.get(beat_id, [])
+                if not group:
+                    duration, note_type, dots, time_modification = rhythmic_notation(event)
+                    measure.append({
+                        "rest": True,
+                        "duration": duration,
+                        "type": note_type,
+                        "dots": dots,
+                        "time_modification": time_modification,
+                    })
+                    continue
+                for i, note in enumerate(group):
+                    source = dict(note)
+                    if not source.get("duration_ticks"):
+                        source["duration_ticks"] = event.get("duration_ticks")
+                    duration, note_type, dots, time_modification = rhythmic_notation(source)
+                    measure.append({
+                        "string": note["string"],
+                        "fret": note["fret"],
+                        "midi": note_midi(note, tuning),
+                        "duration": duration,
+                        "type": note_type,
+                        "dots": dots,
+                        "time_modification": time_modification,
+                        "chord": i > 0,
+                    })
             measures.append(measure)
 
     else:
@@ -247,7 +330,7 @@ def transform(data, template, target_bpm):
 
 def main():
     ap = argparse.ArgumentParser(description="Generate a practice variation from a gscore selection")
-    ap.add_argument("--selection", help="selection.json or draft-request.json")
+    ap.add_argument("--selection", help="selection.json")
     ap.add_argument("--template", default="alternate_picking",
                     choices=["alternate_picking", "arpeggio", "slow_drill"])
     ap.add_argument("--bpm", type=int, default=60)
@@ -258,37 +341,21 @@ def main():
     plugin_data = os.path.expandvars(r"%LOCALAPPDATA%\Tern\plugin-data\gscore")
     sel = args.selection
     if not sel:
-        for candidate in ("draft-request.json", "selection.json"):
-            p = os.path.join(plugin_data, candidate)
-            if os.path.exists(p):
-                sel = p
-                break
+        sel = os.path.join(plugin_data, "selection.json")
     if not sel or not os.path.exists(sel):
         raise SystemExit(f"selection file not found: {sel}")
 
     with open(sel, encoding="utf-8") as f:
         data = json.load(f)
 
-    # a draft-request carries a pointer to the exported selection
-    if data.get("action") == "create_draft":
-        pointed = data.get("selection_file")
-        if not pointed or not os.path.exists(pointed):
-            raise SystemExit("draft-request has no readable selection_file")
-        with open(pointed, encoding="utf-8") as f:
-            data = json.load(f)
-        template = data.get("_template") or args.template
-        template = data.get("template", template)
-    else:
-        template = args.template
-
-    xml_text, title = transform(data, template, args.bpm)
+    xml_text, title = transform(data, args.template, args.bpm)
 
     out = args.out
     if not out:
         stem = os.path.splitext(os.path.basename(data.get("path") or "score"))[0]
         drafts = os.path.join(plugin_data, "drafts")
         os.makedirs(drafts, exist_ok=True)
-        out = os.path.join(drafts, f"draft_{stem}_{template}.musicxml")
+        out = os.path.join(drafts, f"draft_{stem}_{args.template}.musicxml")
 
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
@@ -296,8 +363,8 @@ def main():
 
     note_count = sum(1 for line in xml_text.splitlines() if "<fret>" in line)
     print(f"draft written: {out}")
-    print(f"  title: {title}")
-    print(f"  template: {template} @ {args.bpm} BPM")
+    print(f"  title: {ascii(title)}")
+    print(f"  template: {args.template} @ {args.bpm} BPM")
     print(f"  notes: {note_count}")
 
     if args.open:

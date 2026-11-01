@@ -33,7 +33,7 @@ def run():
     r = subprocess.run([
         NODE_EXE, os.path.join(PLUGIN_DIR, "renderer", "index.mjs"),
         "--input", SAMPLE_PATH, "--out", OUT_DIR, "--width", "800"
-    ], capture_output=True, text=True, cwd=PLUGIN_DIR)
+    ], capture_output=True, text=True, encoding="utf-8", cwd=PLUGIN_DIR)
     assert r.returncode == 0, f"Renderer failed: {r.stderr}"
     data = json.loads(r.stdout)
     full_wav = os.path.join(OUT_DIR, "full.wav")

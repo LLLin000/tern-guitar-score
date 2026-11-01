@@ -1,16 +1,10 @@
-"""Automated end-to-end test for P2 Interactive Practice Workflow.
+"""End-to-end practice workflow test using real alphaTab renderer output.
 
-Validates the full workflow using REAL rendered notes from the test fixture:
-  1. Renders `tests/fixtures/sample.musicxml` with `renderer/index.mjs`.
-  2. Extracts real note events for bars 0..1 to construct `selection.json` (`music_context_v1`).
-  3. Validates that every note satisfies: `expected_midi == tuning[string - 1] + fret`.
-  4. Generates practice drafts via `tools/generate_draft.py` for all 3 templates:
-     - `alternate_picking`: asserts `<down-bow/>` and `<up-bow/>` technical notations
-     - `arpeggio`: asserts `<fingering>p/i/m/a` classical right-hand annotations
-     - `slow_drill`: asserts rhythm doubling and measure capacities
-  5. Renders generated draft with alphaTab and synthesizes SoundFont audio + count-in track.
-  6. Loads and plays draft in `audio_backend.py` via mpv named pipe IPC.
-  7. Verifies clean shutdown with zero orphan mpv processes.
+Validates:
+  1. `realValue == tuning[string - 1] + fret` for fixture notes.
+  2. MusicXML `<pluck>` notation and source rhythm/measure capacity.
+  3. alphaTab draft rendering and mpv playback.
+  4. Clean audio-backend shutdown.
 """
 
 import json
@@ -18,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHON_EXE = sys.executable
@@ -39,40 +34,40 @@ def run():
         "--input", FIXTURE_SCORE,
         "--out", fixture_out,
         "--width", "640"
-    ], capture_output=True, text=True, cwd=PLUGIN_DIR)
+    ], capture_output=True, text=True, encoding="utf-8", cwd=PLUGIN_DIR)
     assert r.returncode == 0, f"Fixture render failed: {r.stderr}"
     fixture_data = json.loads(r.stdout)
     tuning_raw = fixture_data["tuning"]  # [64, 59, 55, 50, 45, 40]
     time_sig = fixture_data.get("timeSignature", [4, 4])
     tempo_bpm = fixture_data.get("tempo_bpm", 120)
 
-    # 2. Extract notes for bars 0 and 1
+    # 2. Extract notes for bars 0 and 1 using alphaTab's independent pitch value
     selected_notes = []
-    OPEN = {1: 40, 2: 45, 3: 50, 4: 55, 5: 59, 6: 64}
     for sys_data in fixture_data["systems"]:
         for n in sys_data["notes"]:
             if n["m"] in (0, 1):
-                # Compute baseMidi according to the alphaTab tuning convention
-                base_midi = tuning_raw[6 - n["string"]] if len(tuning_raw) >= 6 else OPEN[n["string"]]
+                assert n.get("realValue") is not None, f"alphaTab realValue missing: {n}"
                 selected_notes.append({
                     "id": n["id"],
+                    "beat": n["b"],
                     "bar": n["m"],
                     "string": n["string"],
                     "fret": n["fret"],
-                    "midi": base_midi + n["fret"],
-                    "duration_ticks": n.get("durationTicks", 480),
+                    "midi": n["realValue"],
+                    "duration_ticks": n["durationTicks"],
+                    "dots": n.get("dots") or 0,
+                    "tuplet": n.get("tuplet"),
                 })
     print(f"    Extracted {len(selected_notes)} real notes from bars 0..1")
     assert len(selected_notes) >= 8, "Expected at least 8 notes in bars 0..1"
 
-    # 3. Validate pitch equation on every extracted note
-    print("[2/6] Validating pitch equation on extracted notes...")
-    # Normalize tuning to low-to-high [40, 45, 50, 55, 59, 64]
+    # 3. Compare alphaTab's realValue to the independently derived string pitch
+    print("[2/6] Validating alphaTab realValue against tuning + fret...")
     tuning_norm = list(reversed(tuning_raw)) if tuning_raw[0] > tuning_raw[-1] else list(tuning_raw)
     for n in selected_notes:
         expected = tuning_norm[n["string"] - 1] + n["fret"]
         assert n["midi"] == expected, f"Pitch mismatch for note {n}: expected {expected}, got {n['midi']}"
-    print(f"    All {len(selected_notes)} notes satisfy expected_midi == tuning[string-1] + fret")
+    print(f"    All {len(selected_notes)} alphaTab realValue pitches match tuning + fret")
 
     sel_file = os.path.join(TEST_CACHE, "real_selection.json")
     selection_payload = {
@@ -86,7 +81,15 @@ def run():
         "time_signature": time_sig,
         "tuning_midi": tuning_raw,
         "notes": selected_notes,
-        "beats": [{"t": o["t"], "beat_ids": o["nb"]} for o in fixture_data["timeline"] if o["t"] < 4000]
+        "beats": [{
+            "t": event["t"],
+            "bar": event["bar"],
+            "tick": event["tick"],
+            "duration_ticks": event["durationTicks"],
+            "dots": event.get("dots") or 0,
+            "tuplet": event.get("tuplet"),
+            "beat_ids": event["nb"],
+        } for event in fixture_data["timeline"] if event["bar"] in (0, 1)]
     }
     with open(sel_file, "w", encoding="utf-8") as f:
         json.dump(selection_payload, f)
@@ -102,18 +105,59 @@ def run():
             "--template", tmpl,
             "--bpm", "60",
             "--out", draft_xml
-        ], capture_output=True, text=True, cwd=PLUGIN_DIR)
+        ], capture_output=True, text=True, encoding="utf-8", cwd=PLUGIN_DIR)
         assert r.returncode == 0, f"generate_draft failed for {tmpl}: {r.stderr}"
         xml_content = open(draft_xml, encoding="utf-8").read()
         if tmpl == "alternate_picking":
             assert "<down-bow/>" in xml_content and "<up-bow/>" in xml_content
             print(f"    {tmpl}: OK (stroke notations verified)")
         elif tmpl == "arpeggio":
-            assert "<fingering>p</fingering>" in xml_content and "<fingering>i</fingering>" in xml_content
-            print(f"    {tmpl}: OK (p/i/m/a fingering verified)")
+            root = ET.fromstring(xml_content)
+            plucks = {node.text for node in root.findall(".//technical/pluck")}
+            assert plucks == {"p", "i", "m", "a"}
+            assert not root.findall(".//technical/fingering")
+            print(f"    {tmpl}: OK (<pluck> p/i/m/a verified)")
         elif tmpl == "slow_drill":
-            assert xml_content.count("<note>") >= len(selected_notes)
-            print(f"    {tmpl}: OK (duration doubling verified)")
+            root = ET.fromstring(xml_content)
+            measures = root.findall("./part/measure")
+            assert len(measures) == 2
+            divisions = int(root.findtext("./part/measure/attributes/divisions"))
+            base_ticks = {
+                "whole": 4 * divisions, "half": 2 * divisions, "quarter": divisions,
+                "eighth": divisions / 2, "16th": divisions / 4, "32nd": divisions / 8,
+                "64th": divisions / 16, "128th": divisions / 32, "256th": divisions / 64,
+            }
+            expected_ticks = {
+                bar: sum(event["duration_ticks"] for event in selection_payload["beats"] if event["bar"] == bar)
+                for bar in (0, 1)
+            }
+            for bar_index, measure in enumerate(measures):
+                notes = measure.findall("note")
+                measure_ticks = 0
+                pitched_durations = []
+                for note in notes:
+                    duration = int(note.findtext("duration"))
+                    note_type = note.findtext("type")
+                    dots = len(note.findall("dot"))
+                    time_mod = note.find("time-modification")
+                    actual = int(time_mod.findtext("actual-notes")) if time_mod is not None else 1
+                    normal = int(time_mod.findtext("normal-notes")) if time_mod is not None else 1
+                    written = base_ticks[note_type] * ((2 ** (dots + 1) - 1) / (2 ** dots)) * normal / actual
+                    assert abs(written - duration) < 1e-8, f"duration/type mismatch: {ET.tostring(note)}"
+                    if note.find("chord") is None:
+                        measure_ticks += duration
+                    if note.find("pitch") is not None:
+                        pitched_durations.append(duration)
+                assert measure_ticks == expected_ticks[bar_index], (
+                    f"bar {bar_index}: expected {expected_ticks[bar_index]} ticks, got {measure_ticks}"
+                )
+                source_durations = [
+                    note["duration_ticks"] for note in selected_notes if note["bar"] == bar_index
+                ]
+                assert pitched_durations == source_durations, "slow_drill must preserve source note durations"
+            assert len(root.findall(".//note/chord")) == len(selected_notes) - len({n["beat"] for n in selected_notes})
+            assert int(root.find(".//direction/sound").attrib["tempo"]) == 60
+            print(f"    {tmpl}: OK (source rhythm, chords, measure capacity, and tempo verified)")
 
     # 5. Synthesize and render the arpeggio draft in alphaTab
     print("[4/6] Rendering arpeggio draft with alphaTab & SoundFont...")
@@ -124,7 +168,7 @@ def run():
         "--input", draft_arpeggio_xml,
         "--out", draft_render_dir,
         "--width", "640"
-    ], capture_output=True, text=True, cwd=PLUGIN_DIR)
+    ], capture_output=True, text=True, encoding="utf-8", cwd=PLUGIN_DIR)
     assert r.returncode == 0, f"Draft render failed: {r.stderr}"
     draft_meta = json.loads(r.stdout)
     full_wav = os.path.join(draft_render_dir, "full.wav")

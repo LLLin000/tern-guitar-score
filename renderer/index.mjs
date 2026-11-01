@@ -159,6 +159,7 @@ const beatIds = new Map();
 for (const beat of beatBounds.keys()) beatIds.set(beat, beatIds.size);
 const timeline = [];
 for (const mb of tickLookup.masterBars) {
+  const barIndex = mb.masterBar ? mb.masterBar.index : -1;
   let b = mb.firstBeat;
   while (b) {
     const ids = [];
@@ -166,7 +167,17 @@ for (const mb of tickLookup.masterBars) {
       const id = beatIds.get(item.beat);
       if (id !== undefined) ids.push(id);
     }
-    if (ids.length) timeline.push({ t: Math.round(msOfTick(mb.start + b.start)), nb: ids });
+    if (ids.length) timeline.push({
+      t: Math.round(msOfTick(mb.start + b.start)),
+      tick: mb.start + b.start,
+      bar: barIndex,
+      durationTicks: b.nextBeat
+        ? b.nextBeat.start - b.start
+        : mb.end - (mb.start + b.start),
+      dots: b.dotCount || 0,
+      tuplet: b.tuplet ? b.tuplet.numerator + ":" + b.tuplet.denominator : null,
+      nb: ids,
+    });
     b = b.nextBeat;
   }
 }
@@ -215,7 +226,9 @@ const systems = chunks.map((c) => {
       m: beatBar.get(n.beat) ?? -1,
       string: n.string,
       fret: n.fret,
+      realValue: n.realValue,
       durationTicks: n.beatDurationTicks,
+      dots: n.beatDotCount,
       tuplet: n.beatTuplet,
       isTie: n.isTieOrigin || n.isTieDestination,
       isHammerPull: n.isHammerPullOrigin || n.isHammerPullDestination,

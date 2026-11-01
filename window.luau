@@ -8,8 +8,19 @@ local SAMPLE = "D:/L/Guitar/吉他谱/Tears in Heaven.musicxml"
 local EXERCISES = "D:/L/AI/exercises"
 local PYTHON_EXE = "D:/programs/Python/python.exe"
 local REQUEST = tern.plugin.data .. "/open-request.json"
-local DRAFT_REQUEST = tern.plugin.data .. "/draft-request.json"
+local DRAFT_REQUESTS = tern.plugin.data .. "/draft_requests"
+local REQUEST_END_SENTINEL = "\n__GSCORE_END__\n"
 local POLL_MS = 400
+
+-- Async process results wait here until poll provides a live SessionContext for UI work.
+type DraftResult = {
+	res: any,
+	outPath: string,
+	template: string,
+	bars: any,
+	sourcePane: any,
+}
+local draftResults: { DraftResult } = {}
 
 local function scoreFiles(dir: string): { string }
 	local out = {}
@@ -28,20 +39,31 @@ end
 local mine: { number } = {}
 
 
-local function openList(cx: any, files: { string }, isDraft: boolean?)
+local function openList(cx: any, files: { string }, isDraft: boolean?, preferredAnchor: any?)
 	if #files == 0 then
 		cx:toast("error", "No score files")
 		return
 	end
 	local previous = tern.kv.get("panes") or {}
 	mine = previous
-	-- anchor: the focused pane; scores and drafts are appended beside one another
-	-- so the original sheet and every draft stay open together for comparison.
-	local anchor = cx.session:focused()
-	if anchor == nil then
+	-- Prefer the pane that launched a draft; fall back when it has since closed.
+	local anchor = nil
+	if preferredAnchor ~= nil then
+		local wanted = tostring(preferredAnchor)
 		for _, info in cx.session:panes() do
-			anchor = info.pane
-			break
+			if tostring(info.pane) == wanted then
+				anchor = info.pane
+				break
+			end
+		end
+	end
+	if anchor == nil then
+		anchor = cx.session:focused()
+		if anchor == nil then
+			for _, info in cx.session:panes() do
+				anchor = info.pane
+				break
+			end
 		end
 	end
 	if not anchor then
@@ -106,17 +128,18 @@ tern.bind("alt+shift+g", "plugin.gscore.open")
 
 -- agent channel -----------------------------------------------------------
 
--- Draft executor: consume draft-request.json, run the generator, then open the
--- produced MusicXML beside the source pane as a draft.
-local function runDraftRequest(cx: any)
-	local ok, text = pcall(tern.fs.read, DRAFT_REQUEST)
-	if not ok then
+-- Consume every complete per-request draft file; an incomplete write stays queued.
+local function processDraftRequest(cx: any, path: string, requestId: string)
+	local ok, text = pcall(tern.fs.read, path)
+	if not ok or type(text) ~= "string"
+		or text:sub(-#REQUEST_END_SENTINEL) ~= REQUEST_END_SENTINEL then
 		return
 	end
-	pcall(tern.fs.remove, DRAFT_REQUEST)
-	local okj, spec = pcall(tern.json.decode, text)
+	pcall(tern.fs.remove, path)
+	local body = text:sub(1, #text - #REQUEST_END_SENTINEL)
+	local okj, spec = pcall(tern.json.decode, body)
 	if not okj or type(spec) ~= "table" then
-		cx:toast("error", "Bad draft-request.json")
+		cx:toast("error", "Bad draft request", requestId)
 		return
 	end
 	local selFile = spec.selection_file
@@ -126,11 +149,14 @@ local function runDraftRequest(cx: any)
 		cx:toast("error", "Draft failed", "request has no selection_file")
 		return
 	end
+	if template ~= "alternate_picking" and template ~= "arpeggio" and template ~= "slow_drill" then
+		cx:toast("error", "Draft failed", "unknown template: " .. tostring(template))
+		return
+	end
 
 	local outPath = string.format("%s/drafts/draft_%s_%s.musicxml",
-		tern.plugin.data, tostring(spec.request_id or "req"), template)
+		tern.plugin.data, requestId, template)
 	pcall(tern.fs.mkdir, tern.plugin.data .. "/drafts")
-
 	cx:toast("info", "Generating draft…", template .. " @ " .. bpm .. " BPM")
 
 	tern.process.run({
@@ -140,15 +166,42 @@ local function runDraftRequest(cx: any)
 		"--bpm", bpm,
 		"--out", outPath,
 	}, { timeout_ms = 60000 }):next(function(res)
-		if not res or res.status ~= 0 or not tern.fs.exists(outPath) then
+		table.insert(draftResults, {
+			res = res,
+			outPath = outPath,
+			template = template,
+			bars = spec.bars,
+			sourcePane = spec.source_pane,
+		})
+	end)
+end
+
+local function runDraftRequest(cx: any)
+	local ok, names = pcall(tern.fs.list, DRAFT_REQUESTS)
+	if not ok or type(names) ~= "table" then
+		return
+	end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		if name:match("^req_%d+_%d+%.json$") then
+			processDraftRequest(cx, DRAFT_REQUESTS .. "/" .. name, name:gsub("%.json$", ""))
+		end
+	end
+end
+
+local function flushDraftResults(cx: any)
+	while #draftResults > 0 do
+		local result = table.remove(draftResults, 1)
+		local res = result.res
+		if not res or res.status ~= 0 or not tern.fs.exists(result.outPath) then
 			cx:toast("error", "Draft generation failed",
 				res and (res.stderr ~= "" and res.stderr or res.stdout) or "no output")
-			return
+		else
+			cx:toast("success", "Draft ready", result.template .. " · bars " ..
+				tostring((result.bars or {})[1] or "?") .. "–" .. tostring((result.bars or {})[2] or "?"))
+			openList(cx, { result.outPath }, true, result.sourcePane)
 		end
-		cx:toast("success", "Draft ready", template .. " · bars " ..
-			tostring((spec.bars or {})[1] or "?") .. "–" .. tostring((spec.bars or {})[2] or "?"))
-		openList(cx, { outPath }, true)
-	end)
+	end
 end
 
 local function consume(cx: any)
@@ -216,6 +269,7 @@ local function poll(cx: any)
 	if cx ~= nil then
 		pcall(consume, cx)
 		pcall(runDraftRequest, cx)
+		pcall(flushDraftResults, cx)
 	end
 	tern.timer(POLL_MS, poll)
 end

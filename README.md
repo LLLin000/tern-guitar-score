@@ -58,14 +58,14 @@ The companion turns selected measures into practice variations that open side by
 
 1. **Select measures**: Click or Shift-click measures on any score pane.
 2. **Request draft**:
-   - **In UI**: Click the **wand button (`🪄`)** on the toolbar. It writes a structured `draft-request.json` (with `selection_file`, `source_pane`, `request_id`, `bars`, `template`, `bpm`), which `window.luau`'s background executor automatically picks up, generates via `tools/generate_draft.py`, and opens beside the original score.
+   - **In UI**: Click the **wand button (`🪄`)**. `host.luau` writes a sentinel-terminated selection snapshot and a unique `draft_requests/req_<timestamp>_<nonce>.json`; `window.luau` consumes every complete request, generates it, and opens it beside the recorded `source_pane` (falling back to focus only if that pane closed). The sentinel detects incomplete writes; it is not a filesystem-atomic rename.
    - **Via CLI / Agent**: Run `python tools/generate_draft.py --open` to create and open a variation immediately.
 3. **Musical semantics & validation**:
-   - Sounding pitch is strictly validated against `expected_midi = tuning[string - 1] + fret`. Incoherent notes are rejected, not silently invented.
-   - Empty selections are rejected rather than falling back to unrelated exercises.
-   - `alternate_picking`: writes MusicXML `<down-bow/>` and `<up-bow/>` stroke direction notations according to time signature capacity.
-   - `arpeggio`: annotates classical right-hand fingerings (`p`, `i`, `m`, `a`).
-   - `slow_drill`: preserves source rhythm while doubling note durations for motor placement.
+   - alphaTab `realValue` is checked against `expected_midi = tuning[string - 1] + fret`; incoherent notes are rejected.
+   - Empty selections are rejected rather than replaced with unrelated exercises.
+   - `alternate_picking`: writes MusicXML `<down-bow/>` and `<up-bow/>` stroke direction notations.
+   - `arpeggio`: uses MusicXML `<pluck>` marks for right-hand fingers (`p`, `i`, `m`, `a`).
+   - `slow_drill`: preserves selected notes, chords, rests, and source durations/types while applying the requested slower tempo.
 4. **Practice & compare**:
    - The variation opens as a split pane beside the original score labeled `[Draft]`.
    - Existing panes are preserved (never closed) so original and variations stay side by side.
@@ -78,7 +78,7 @@ python tools/generate_draft.py --template alternate_picking --bpm 60 --open
 # Generate an arpeggio study from chord tones in the selection
 python tools/generate_draft.py --template arpeggio --bpm 72 --open
 
-# Slow drill: double duration for finger placement practice
+# Slow drill: preserve the source rhythm at the requested slower tempo
 python tools/generate_draft.py --template slow_drill --bpm 50 --open
 ```
 
@@ -123,18 +123,20 @@ node renderer/index.mjs --input score.gp5 --out <cache dir> --width 800
 python audio_backend.py <cache dir>
 ```
 
-The plugin start sends commands by appending JSONL to `<cache dir>/audio_cmd.jsonl`; the backend
-consumes the file atomically and reports state in `audio_state.json` every 30 ms.
+The plugin writes each command to an ordered file under `<cache dir>/cmds/`, followed by
+`__GSCORE_END__`. The backend waits for that terminal completeness sentinel before parsing;
+this detects interrupted writes but is not a filesystem-atomic publish. State is published
+atomically to `audio_state.json` every 30 ms.
 
 ## Tests
 
-Both suites run against the repo-local fixture `tests/fixtures/sample.musicxml`, so they need no
+All three suites run against the repo-local fixture `tests/fixtures/sample.musicxml`, so they need no
 private paths.
 
 ```bash
 python tests/test_audio_backend.py     # burst queue, 1.25x ratio, 6s pause watchdog
-python tests/test_concurrency.py       # atomic cmds/ queue, monotonic seq, A-B bounds,
-                                       # 10s pause resume position, zero orphan mpv (Job Object)
+python tests/test_concurrency.py       # sentinel recovery, repeated/corrupt commands, monotonic seq,
+                                       # A-B bounds, 10s pause/resume, zero orphan mpv
 python tests/test_interactive_workflow.py # P2 end-to-end: selection -> generate draft -> render -> play
 ```
 

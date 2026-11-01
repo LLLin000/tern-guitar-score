@@ -27,13 +27,15 @@ local TICK_MS = 40
 local STEP_MS = 5000
 local MAX_COLUMNS = 4
 
-type Occ = { t: number, nb: { number } }
+type Occ = { t: number, tick: number?, bar: number?, durationTicks: number?, dots: number?, tuplet: string?, nb: { number } }
 type Note = {
 	id: number,
 	b: number,
 	m: number,
 	string: number,
 	fret: number,
+	realValue: number?,
+	dots: number?,
 	x: number,
 	y: number,
 	w: number,
@@ -181,11 +183,14 @@ local function exportSelection(sc: Score, destPath: string?): any
 				end
 				table.insert(notes, {
 					id = n.id,
+					beat = n.b,
 					bar = n.m,
 					string = n.string,
 					fret = n.fret,
-					midi = baseMidi + (n.fret or 0),
+					real_value = n.realValue,
+					midi = n.realValue or (baseMidi + (n.fret or 0)),
 					duration_ticks = n.durationTicks,
+					dots = n.dots,
 					tuplet = n.tuplet,
 					is_tie = n.isTie,
 					is_hammer_pull = n.isHammerPull,
@@ -200,7 +205,11 @@ local function exportSelection(sc: Score, destPath: string?): any
 	local spans = {}
 	for _, o in ipairs(sc.timeline) do
 		if o.t >= (sc.selT0 or 0) and o.t <= (sc.selT1 or 0) then
-			table.insert(beats, { t = o.t, beat_ids = o.nb })
+			table.insert(beats, {
+				t = o.t, bar = o.bar, tick = o.tick,
+				duration_ticks = o.durationTicks, dots = o.dots,
+				tuplet = o.tuplet, beat_ids = o.nb,
+			})
 		end
 	end
 	for i = 1, #beats - 1 do
@@ -257,9 +266,8 @@ end
 
 -- playback -----------------------------------------------------------------
 
--- atomic per-command queue: each command is an isolated sequentially
--- numbered file inside `<cache>/cmds/`. This eliminates all read-modify-write
--- races between Luau writers and the python reader.
+-- sentinel-delimited per-command files in `<cache>/cmds/` avoid read-modify-write
+-- races between Luau writers and the Python reader; the sentinel detects partial writes.
 local function cmdsDir(sc: Score): string
 	local dir = sc.out .. "/cmds"
 	pcall(tern.fs.mkdir, dir)
@@ -270,9 +278,9 @@ local function stateFile(sc: Score): string
 	return sc.out .. "/audio_state.json"
 end
 
--- Luau has no rename, so publish atomically with an end sentinel: the reader
--- only consumes a file whose body terminates with END_SENTINEL, which a
--- half-written file never does.
+-- Luau has no rename, so command completeness uses an end sentinel: the reader
+-- only consumes a file whose body terminates with END_SENTINEL. This is not a
+-- filesystem-atomic publish.
 local END_SENTINEL = "\n__GSCORE_END__\n"
 
 local function sendCmd(sc: Score, payload: any)
@@ -874,7 +882,9 @@ local def: BlockDef<State> = {
 				return
 			end
 			local requestId = string.format("req_%d_%d", math.floor(tern.now()), math.random(100000))
+			local requestDir = tern.plugin.data .. "/draft_requests"
 			local draftsDir = tern.plugin.data .. "/drafts"
+			pcall(tern.fs.mkdir, requestDir)
 			pcall(tern.fs.mkdir, draftsDir)
 			local selFile = draftsDir .. "/selection_" .. requestId .. ".json"
 			-- keep a per-request snapshot so the generator never reads a newer selection
@@ -893,7 +903,8 @@ local def: BlockDef<State> = {
 				bpm = 60,
 				created_at = math.floor(tern.now()),
 			}
-			pcall(tern.fs.write, tern.plugin.data .. "/draft-request.json", tern.json.encode(reqPayload, true))
+			pcall(tern.fs.write, requestDir .. "/" .. requestId .. ".json",
+				tern.json.encode(reqPayload, true) .. END_SENTINEL)
 			cx:toast("info", "Draft requested",
 				"Bars " .. tostring(sc0.selA) .. "–" .. tostring(sc0.selB or sc0.selA) .. " · " .. tostring(sc0.draftTemplate or "alternate_picking"))
 			return

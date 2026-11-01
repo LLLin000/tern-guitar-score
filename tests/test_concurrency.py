@@ -1,12 +1,11 @@
 """Concurrency hardening regression suite for gscore audio engine.
 
 Validates:
-  1. Atomic per-command queue in `cmds/` (no read-modify-write races).
+  1. Sentinel-delimited command files, including interrupted, repeated, and corrupt payloads.
   2. Strictly increasing state `seq` and stable `instance_id`.
-  3. Pending seek delivery after load (via file-loaded / playback-restart).
-  4. A-B Loop bounds preservation.
-  5. 10s pause watchdog survival and resume position.
-  6. Zero orphan mpv processes after exit (Windows Job Object).
+  3. Pending seek delivery after load and A-B loop bounds.
+  4. 10s pause watchdog survival and resume position.
+  5. Zero orphan mpv processes after exit (Windows Job Object).
 
 Usage:
   python tests/test_concurrency.py [path/to/sample.gp5]
@@ -57,7 +56,7 @@ def run():
     r = subprocess.run([
         NODE_EXE, os.path.join(PLUGIN_DIR, "renderer", "index.mjs"),
         "--input", SAMPLE_PATH, "--out", OUT_DIR, "--width", "800"
-    ], capture_output=True, text=True, cwd=PLUGIN_DIR)
+    ], capture_output=True, text=True, encoding="utf-8", cwd=PLUGIN_DIR)
     assert r.returncode == 0, f"Renderer failed: {r.stderr}"
     data = json.loads(r.stdout)
     full_wav = os.path.join(OUT_DIR, "full.wav")
@@ -83,8 +82,8 @@ def run():
     time.sleep(0.8)
 
     try:
-        # --- 2. Atomic command queue
-        print("[3/6] Bursting 6 atomic commands (load -> speed -> play -> loop -> seek)...")
+        # --- 2. Sentinel-delimited command queue
+        print("[3/6] Bursting 6 queued commands (load -> speed -> play -> loop -> seek)...")
         burst = [
             {"action": "load", "file": full_wav, "pos_ms": 0, "paused": True},
             {"action": "speed", "speed": 1.25},
@@ -107,8 +106,38 @@ def run():
         instance_id = st["instance_id"]
         print(f"    instance_id={instance_id}  ALL BURST COMMANDS EXECUTED IN ORDER")
 
-        # --- 3. Monotonic seq
-        print("[4/6] Verifying monotonic state seq...")
+        # --- 3. Sentinel recovery and malformed/repeated commands
+        print("[4/6] Verifying incomplete, repeated, and corrupt command files...")
+        partial_path = os.path.join(cmds_dir, "00000007.json")
+        with open(partial_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"action": "speed", "speed": 1.5}))
+        time.sleep(0.2)
+        assert os.path.exists(partial_path), "incomplete write must remain queued"
+        assert abs(read_state(state_file)["speed"] - 1.25) < 0.02, "incomplete payload must not execute"
+        with open(partial_path, "a", encoding="utf-8") as f:
+            f.write("\n__GSCORE_END__\n")
+        time.sleep(0.4)
+        assert abs(read_state(state_file)["speed"] - 1.5) < 0.02, "completed payload must execute"
+        assert not os.path.exists(partial_path), "completed command must be drained"
+
+        duplicate = {"action": "speed", "speed": 1.1}
+        write_cmd(cmds_dir, 8, duplicate)
+        write_cmd(cmds_dir, 9, duplicate)
+        time.sleep(0.4)
+        assert abs(read_state(state_file)["speed"] - 1.1) < 0.02, "repeated idempotent command must apply"
+        assert os.listdir(cmds_dir) == [], "repeated commands must be drained"
+
+        corrupt_path = os.path.join(cmds_dir, "00000010.json")
+        with open(corrupt_path, "w", encoding="utf-8") as f:
+            f.write('{"action":' + "\n__GSCORE_END__\n")
+        write_cmd(cmds_dir, 11, {"action": "speed", "speed": 1.25})
+        time.sleep(0.4)
+        assert proc.poll() is None, "corrupt payload must not kill the backend"
+        assert abs(read_state(state_file)["speed"] - 1.25) < 0.02, "valid command after corrupt payload must execute"
+        assert os.listdir(cmds_dir) == [], "corrupt and valid command files must be drained"
+
+        # --- 4. Monotonic state sequence
+        print("[5/6] Verifying monotonic state seq...")
         seqs = []
         for _ in range(6):
             time.sleep(0.1)
@@ -118,8 +147,8 @@ def run():
         assert all(b > a for a, b in zip(seqs, seqs[1:])), f"seq must strictly increase: {seqs}"
         print(f"    seq progression: {seqs}  MONOTONIC OK")
 
-        # --- 4. Resume / polling identity
-        print("[5/6] Pausing 10s then resuming; position must be preserved...")
+        # --- 5. Resume / polling identity
+        print("[6/6] Pausing 10s then resuming; position must be preserved...")
         write_cmd(cmds_dir, 100, {"action": "pause"})
         time.sleep(0.4)
         pos_paused = read_state(state_file)["pos_ms"]
@@ -140,6 +169,7 @@ def run():
 
         write_cmd(cmds_dir, 102, {"action": "quit"})
         time.sleep(0.5)
+
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -151,7 +181,7 @@ def run():
     print(f"    mpv after shutdown: {after_mpv} (baseline was {baseline_mpv})")
     assert after_mpv <= baseline_mpv, f"orphan mpv processes leaked: {after_mpv}"
 
-    print("\n>>> CONCURRENCY SUITE PASSED: atomic queue, monotonic seq, resume, job reclamation <<<")
+    print("\n>>> CONCURRENCY SUITE PASSED: sentinel recovery, monotonic seq, resume, job reclamation <<<")
 
 if __name__ == "__main__":
     run()

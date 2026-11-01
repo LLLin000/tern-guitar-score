@@ -18,7 +18,7 @@ Concurrency & Robustness:
   - Windows Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:
     Kernel-guaranteed termination of mpv child process on parent exit.
   - Command input:
-      1) Ordered per-command atomic files in `<cache_dir>/cmds/*.json`
+      1) Ordered per-command files in `<cache_dir>/cmds/*.json`, each ending with a completeness sentinel
       2) Legacy JSONL queue `<cache_dir>/audio_cmd.jsonl`
   - Atomic state broadcast every 30ms via `<cache_dir>/audio_state.json` with:
       - `instance_id`: string (unique per backend run)
@@ -338,7 +338,7 @@ def main():
         while controller.running:
             now = time.time()
             
-            # 1. Process atomic per-command files in cmds/ (in alphanumeric sorted order)
+            # 1. Process sentinel-terminated per-command files in sequence order
             try:
                 cmd_files = sorted(f for f in os.listdir(cmds_dir) if f.endswith(".json"))
                 for cf in cmd_files:
@@ -346,11 +346,12 @@ def main():
                     try:
                         with open(full_cf, "r", encoding="utf-8") as f:
                             raw = f.read()
-                        # A half-written file lacks the sentinel; leave it for the next tick
-                        if "__GSCORE_END__" not in raw:
+                        # The terminal sentinel detects completeness; it is not an atomic rename.
+                        sentinel = "\n__GSCORE_END__\n"
+                        if not raw.endswith(sentinel):
                             continue
                         os.remove(full_cf)
-                        cleaned = raw.replace("__GSCORE_END__", "").strip()
+                        cleaned = raw[:-len(sentinel)].strip()
                         if cleaned:
                             cmd_data = json.loads(cleaned)
                             if not execute_cmd_dict(controller, cmd_data):
