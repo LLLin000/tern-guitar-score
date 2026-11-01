@@ -25,7 +25,7 @@ end
 -- one column on the right of the focused pane, one row per score
 local mine: { number } = {}
 
-local function openList(cx: any, files: { string })
+local function openList(cx: any, files: { string }, isDraft: boolean?)
 	if #files == 0 then
 		cx:toast("error", "No score files")
 		return
@@ -68,8 +68,10 @@ local function openList(cx: any, files: { string })
 	end
 	tern.kv.set("panes", {})
 	mine = {}
+	local a1 = { files[1] }
+	if isDraft then table.insert(a1, "draft") end
 	local column = cx.layout:split(anchor, "right", {
-		block = "gscore.score", args = { files[1] },
+		block = "gscore.score", args = a1,
 	})
 	if not column then
 		cx:toast("error", "Could not split the pane")
@@ -176,7 +178,7 @@ local function consume(cx: any)
 		return
 	end
 	if type(spec.file) == "string" and spec.file ~= "" then
-		openList(cx, { spec.file })
+		openList(cx, { spec.file }, spec.draft == true)
 		return
 	end
 	openList(cx, scoreFiles(tostring(spec.root or EXERCISES)))

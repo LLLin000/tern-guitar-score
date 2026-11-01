@@ -52,6 +52,29 @@ Luau never synthesises audio and never keeps its own playback clock.
 `player.py` and `slice.py` are retired: mpv seeks natively, so pre-sliced segments are no longer
 needed.
 
+## Interactive Practice Workflow (P2)
+
+The companion turns selected measures into practice variations that open side by side:
+
+1. **Select measures**: Click or Shift-click measures on any score pane.
+2. **Request draft**:
+   - In UI: Click the **wand button (`🪄`)** on the toolbar to export selection and request a draft.
+   - Via CLI: Run `python tools/generate_draft.py --open` to create and open a variation immediately.
+3. **Practice & compare**:
+   - The variation opens as a split pane beside the original score labeled `[Draft]`.
+   - Both original and draft can be independently played, looped, and auditioned.
+
+```bash
+# Generate an alternate-picking study at 60 BPM and open beside the original
+python tools/generate_draft.py --template alternate_picking --bpm 60 --open
+
+# Generate an arpeggio study from chord tones in the selection
+python tools/generate_draft.py --template arpeggio --bpm 72 --open
+
+# Slow drill: double duration for finger placement practice
+python tools/generate_draft.py --template slow_drill --bpm 50 --open
+```
+
 ## Agent interface
 
 Drop a request file in the plugin data directory; the window half polls it every 400 ms.
@@ -105,6 +128,7 @@ private paths.
 python tests/test_audio_backend.py     # burst queue, 1.25x ratio, 6s pause watchdog
 python tests/test_concurrency.py       # atomic cmds/ queue, monotonic seq, A-B bounds,
                                        # 10s pause resume position, zero orphan mpv (Job Object)
+python tests/test_interactive_workflow.py # P2 end-to-end: selection -> generate draft -> render -> play
 ```
 
 

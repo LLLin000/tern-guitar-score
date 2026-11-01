@@ -83,6 +83,7 @@ type Score = {
 	backendSeq: number?,
 	lastBackendActiveAt: number?,
 	lastActiveSys: number?,
+	isDraft: boolean,
 	tuning: { number },
 	timeSignature: { number },
 	cur: { [number]: boolean },
@@ -646,10 +647,12 @@ local def: BlockDef<State> = {
 		end
 		local state: State = { scores = {}, active = 1, width = width }
 		for _, path in ipairs(files) do
+			local isDraft = (args[2] == "draft") or (path:find("draft_") ~= nil)
+			local rawTitle = path:match("[^/\\]+$") or path
 			local sc: Score = {
 				path = path,
 				out = cacheDir(path, width),
-				title = path:match("[^/\\]+$") or path,
+				title = if isDraft then ("[Draft] " .. rawTitle) else rawTitle,
 				status = "loading",
 				err = nil,
 				duration = 0,
@@ -678,6 +681,7 @@ local def: BlockDef<State> = {
 				backendSeq = nil,
 				lastBackendActiveAt = nil,
 				lastActiveSys = nil,
+				isDraft = isDraft,
 				tuning = {},
 				timeSignature = { 4, 4 },
 				cur = {},
@@ -747,6 +751,14 @@ local def: BlockDef<State> = {
 			-- Count-in toggle button
 			table.insert(bar, button("sparkle", "count_in_toggle", "Count-in: " .. (if sc.countIn then "ON" else "OFF"),
 				if sc.countIn then "accent" else "muted"))
+			-- Agent Draft button when bars are selected
+			if sc.selA ~= nil then
+				local barsLabel = tostring(sc.selA) .. "–" .. tostring(sc.selB or sc.selA)
+				table.insert(bar, button("wand", "agent_draft", "Ask Agent to create practice variation for bars " .. barsLabel, "accent"))
+			end
+			if sc.isDraft then
+				table.insert(bar, ui.node("badge", { text = "Agent Draft", tone = "accent", title = "AI-generated practice variation" }))
+			end
 			-- Speed button
 			local speedLabel = string.format("%.2fx", sc.speed or 1.0)
 			table.insert(bar, button("speed", "speed_cycle", "Speed: " .. speedLabel .. " (click to cycle 0.75x/1.0x/1.25x)"))
@@ -838,6 +850,24 @@ local def: BlockDef<State> = {
 					pcall(tern.fs.write, REQUEST, tern.json.encode({ file = path }))
 				end
 			end)
+			return
+		end
+		if act == "agent_draft" then
+			local sc0 = state.scores[state.active]
+			if sc0 and sc0.selA ~= nil then
+				exportSelection(sc0)
+				local reqPayload = {
+					action = "create_draft",
+					source_score = sc0.path,
+					title = sc0.title,
+					bars = { sc0.selA, sc0.selB or sc0.selA },
+					t0 = sc0.selT0,
+					t1 = sc0.selT1,
+					created_at = math.floor(tern.now()),
+				}
+				pcall(tern.fs.write, tern.plugin.data .. "/draft-request.json", tern.json.encode(reqPayload, true))
+				cx:toast("info", "Draft requested", "Bars " .. tostring(sc0.selA) .. "–" .. tostring(sc0.selB or sc0.selA) .. " exported for Agent")
+			end
 			return
 		end
 		if act == "playpause" or act == "stop" or act == "home" or act == "back"
