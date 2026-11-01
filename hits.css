@@ -5,6 +5,8 @@
 	max-width: 100%;
 	height: auto;
 	scroll-margin-top: 54px;
+	box-shadow: 0 0 0 1px rgb(90 150 255 / 30%);
+	border-radius: 3px;
 }
 
 .sf-image[data-role="score"] {

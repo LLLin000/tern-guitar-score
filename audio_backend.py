@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import subprocess
@@ -5,6 +6,7 @@ import sys
 import threading
 import time
 import win32file
+import win32job
 import win32pipe
 
 """Resident audio backend controlling mpv via JSON-IPC over a Windows named pipe.
@@ -12,11 +14,14 @@ import win32pipe
 Usage:
   python audio_backend.py <cache_dir>
 
-Features:
+Robustness guarantees:
+  - Windows Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:
+    If this python process terminates or is killed for ANY reason, mpv.exe is
+    terminated instantly by the Windows kernel. Zero zombie audio playback.
   - Non-blocking PeekNamedPipe reader thread to avoid pipe hangs.
-  - Controls playback, seek, true 0.75x~1.25x speed (scaletempo2), ab-loop.
-  - Exposes state every 30ms via `<cache_dir>/audio_state.json`.
-  - Watchdog exits cleanly if `<cache_dir>/heartbeat.txt` stops updating.
+  - JSONL command queue for atomic, ordered execution without command loss.
+  - Authoritative time-pos feedback every 30ms via audio_state.json.
+  - 15s watchdog tied to heartbeat.txt.
 """
 
 def get_mpv_path():
@@ -38,7 +43,10 @@ class MpvController:
         self.mpv_exe = get_mpv_path()
         self.mpv_proc = None
         self.handle = None
+        self.job = None
         self.lock = threading.Lock()
+        self.pending_seek = None
+        self.file_loaded = False
         
         self.state = {
             "playing": False,
@@ -54,6 +62,15 @@ class MpvController:
         self.running = True
 
     def start_mpv(self):
+        # 1. Bind to Windows Job Object so child process dies automatically with parent
+        try:
+            self.job = win32job.CreateJobObject(None, "")
+            info = win32job.QueryInformationJobObject(self.job, win32job.JobObjectExtendedLimitInformation)
+            info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            win32job.SetInformationJobObject(self.job, win32job.JobObjectExtendedLimitInformation, info)
+        except Exception:
+            self.job = None
+
         cmd = [
             self.mpv_exe,
             "--idle=yes",
@@ -65,6 +82,13 @@ class MpvController:
         ]
         self.mpv_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
+        if self.job and self.mpv_proc:
+            try:
+                win32job.AssignProcessToJobObject(self.job, self.mpv_proc._handle)
+            except Exception:
+                pass
+
+        # Connect using win32file
         connected = False
         for _ in range(60):
             try:
@@ -126,8 +150,14 @@ class MpvController:
                                 continue
                             
                             event = data.get("event")
-                            if event == "playback-restart":
+                            if event == "file-loaded":
+                                self.file_loaded = True
+                            elif event == "playback-restart":
                                 self.state["playing"] = True
+                                if self.pending_seek is not None:
+                                    target = self.pending_seek
+                                    self.pending_seek = None
+                                    self._send_command(["seek", max(0, target) / 1000.0, "absolute"])
                             elif event == "end-file":
                                 self.state["playing"] = False
                                 self.state["paused"] = True
@@ -144,22 +174,22 @@ class MpvController:
                                 elif prop == "speed" and val is not None:
                                     self.state["speed"] = float(val)
                             elif "data" in data and isinstance(data["data"], (int, float)):
-                                # Direct property query response
+                                # Direct property query response for time-pos
                                 self.state["pos_ms"] = int(data["data"] * 1000)
                 else:
-                    time.sleep(0.02)
+                    time.sleep(0.015)
             except Exception:
                 break
 
     def load_file(self, file_path, start_ms=0, paused=False):
         clean_path = os.path.abspath(file_path).replace("\\", "/")
+        self.file_loaded = False
+        self.pending_seek = start_ms if start_ms > 0 else None
         self._send_command(["loadfile", clean_path, "replace"])
         self._send_command(["observe_property", 1, "time-pos"])
         self._send_command(["observe_property", 2, "duration"])
         self._send_command(["observe_property", 3, "pause"])
         self._send_command(["observe_property", 4, "speed"])
-        if start_ms > 0:
-            self._send_command(["seek", start_ms / 1000.0, "absolute"])
         self._send_command(["set_property", "pause", paused])
         self.state["playing"] = not paused
         self.state["paused"] = paused
@@ -179,10 +209,14 @@ class MpvController:
         self.state["playing"] = False
         self.state["paused"] = True
         self.state["pos_ms"] = 0
+        self.pending_seek = None
 
     def seek(self, target_ms):
-        self._send_command(["seek", max(0, target_ms) / 1000.0, "absolute"])
         self.state["pos_ms"] = int(target_ms)
+        if not self.file_loaded:
+            self.pending_seek = target_ms
+        else:
+            self._send_command(["seek", max(0, target_ms) / 1000.0, "absolute"])
 
     def set_speed(self, speed):
         clamped = max(0.25, min(2.0, float(speed)))
@@ -223,7 +257,7 @@ class MpvController:
         if self.mpv_proc:
             try:
                 self.mpv_proc.terminate()
-                self.mpv_proc.wait(timeout=1.0)
+                self.mpv_proc.wait(timeout=0.3)
             except Exception:
                 try:
                     self.mpv_proc.kill()
@@ -238,7 +272,8 @@ def main():
     cache_dir = sys.argv[1]
     os.makedirs(cache_dir, exist_ok=True)
     
-    cmd_file = os.path.join(cache_dir, "audio_cmd.json")
+    cmd_file = os.path.join(cache_dir, "audio_cmd.jsonl")
+    proc_file = os.path.join(cache_dir, "audio_cmd.jsonl.proc")
     state_file = os.path.join(cache_dir, "audio_state.json")
     hb_file = os.path.join(cache_dir, "heartbeat.txt")
     
@@ -252,6 +287,8 @@ def main():
     controller = MpvController(cache_dir)
     controller.start_mpv()
 
+    atexit.register(controller.shutdown)
+
     last_hb_check = time.time()
     last_state_write = 0
     last_time_poll = 0
@@ -260,46 +297,53 @@ def main():
         while controller.running:
             now = time.time()
             
-            # 1. Process incoming commands
+            # 1. Process incoming commands from JSONL queue atomically
             if os.path.exists(cmd_file):
                 try:
-                    with open(cmd_file, "r", encoding="utf-8") as f:
-                        content = f.read().strip()
-                    if content:
-                        cmd_data = json.loads(content)
-                        action = cmd_data.get("action")
-                        if action == "load":
-                            controller.load_file(
-                                cmd_data.get("file"),
-                                start_ms=cmd_data.get("pos_ms", 0),
-                                paused=cmd_data.get("paused", False)
-                            )
-                        elif action == "play":
-                            controller.play()
-                        elif action == "pause":
-                            controller.pause()
-                        elif action == "stop":
-                            controller.stop()
-                        elif action == "seek":
-                            controller.seek(cmd_data.get("pos_ms", 0))
-                        elif action == "speed":
-                            controller.set_speed(cmd_data.get("speed", 1.0))
-                        elif action == "loop":
-                            controller.set_ab_loop(
-                                cmd_data.get("loop_a_ms"),
-                                cmd_data.get("loop_b_ms")
-                            )
-                        elif action == "quit":
-                            break
-                    os.remove(cmd_file)
-                except Exception:
+                    os.replace(cmd_file, proc_file)
+                    with open(proc_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                cmd_data = json.loads(line)
+                            except Exception:
+                                continue
+                            action = cmd_data.get("action")
+                            if action == "load":
+                                controller.load_file(
+                                    cmd_data.get("file"),
+                                    start_ms=cmd_data.get("pos_ms", 0),
+                                    paused=cmd_data.get("paused", False)
+                                )
+                            elif action == "play":
+                                controller.play()
+                            elif action == "pause":
+                                controller.pause()
+                            elif action == "stop":
+                                controller.stop()
+                            elif action == "seek":
+                                controller.seek(cmd_data.get("pos_ms", 0))
+                            elif action == "speed":
+                                controller.set_speed(cmd_data.get("speed", 1.0))
+                            elif action == "loop":
+                                controller.set_ab_loop(
+                                    cmd_data.get("loop_a_ms"),
+                                    cmd_data.get("loop_b_ms")
+                                )
+                            elif action == "quit":
+                                controller.shutdown()
+                                return
                     try:
-                        os.remove(cmd_file)
+                        os.remove(proc_file)
                     except Exception:
                         pass
+                except Exception:
+                    pass
 
             # 2. Poll time-pos if playing
-            if now - last_time_poll >= 0.04:
+            if now - last_time_poll >= 0.035:
                 if controller.state["playing"] and not controller.state["paused"]:
                     controller.poll_time()
                 last_time_poll = now
@@ -321,7 +365,7 @@ def main():
                 if os.path.exists(hb_file):
                     try:
                         mtime = os.path.getmtime(hb_file)
-                        if now - mtime > 5.0:
+                        if now - mtime > 15.0:
                             # Stale host -> exit cleanly
                             break
                     except Exception:

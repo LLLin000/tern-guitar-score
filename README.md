@@ -1,23 +1,113 @@
 # Tern Guitar Score (`gscore`)
 
-Tern 终端/工作区插件：基于 alphaTab + SoundFont + Luau 节点树的交互式吉他谱/六线谱播放与练习工具。
+Interactive guitar tablature player and practice companion for [Tern](https://docs.stencil.so/tern/),
+built on alphaTab (layout + SoundFont synthesis) and a resident mpv audio engine.
 
-## 特性
+## What it does
 
-- **多格式支持**：`.gp`, `.gp3`, `.gp4`, `.gp5`, `.gpx`, `.musicxml`, `.xml`, `.mxl`。
-- **真实音色合成**：alphaTab 内置 Sonivox SoundFont 离线渲染采样音频，带软限幅防削波。
-- **交互式游标**：按小节与拍位精准高亮跟随，自适应面板宽度无偏移。
-- **循环与选段**：支持整曲播放、单小节循环、Shift 连选多小节循环。
-- **系统文件选择器**：工具栏直接调起操作系统文件对话框。
-- **Agent 交互通道**：通过 `open-request.json` 支持 Agent 自动排版并排练习曲面板、导出 `selection.json` 结构化选段给 Agent 改写。
+- **Formats.** `.musicxml`, `.xml`, `.mxl`, `.gp`, `.gp3`, `.gp4`, `.gp5`, `.gpx` — all eight
+  verified end to end (import → render → audio → interactive notes).
+- **Real audio.** alphaTab's bundled Sonivox SoundFont is exported offline to a 44.1 kHz stereo
+  WAV with peak normalisation and a `tanh` soft limiter (no clipped samples).
+- **True audio clock.** Playback state comes from mpv's `time-pos`, not a Luau timer, so the
+  cursor cannot drift away from what you hear.
+- **Transport.** Play/pause, stop, ±5 s seek, bar-range loop, click-a-note-to-seek, and a
+  pitch-preserving speed cycle (0.75× / 1.0× / 1.25×) via mpv's `scaletempo2`.
+- **Count-in.** One bar of metronome clicks (accented downbeat) rendered per score, played
+  before the first real beat.
+- **Multi-score layout.** Several scores side by side in split panes, each with its own
+  transport.
+- **Agent channel.** `selection.json` (`music_context_v1`) exports the selected bars as
+  structured music: stable note ids, string/fret, absolute MIDI, durations, tuplets, ties,
+  hammer-ons, slides, tuning and time signature.
 
-## 目录结构
+## Architecture
 
-- `plugin.toml`：插件清单
-- `host.luau`：宿主逻辑（谱面渲染、状态管理、播放控制、热区布局）
-- `window.luau`：窗口管理（分屏排版、Agent 通道轮询）
-- `hits.css`：坐标与浮层样式
-- `renderer/index.mjs`：基于 alphaTab 的排版与 SoundFont 音频生成器
-- `player.py`：低延迟音频播放引擎
-- `slice.py`：WAV 选段与无缝切片器
-- `pickfile.py`：系统原生文件选择对话框
+Four layers, each owning one concern:
+
+```
+Tern Native UI (Luau)        shots, hit boxes, cursor, toolbar, split panes
+  ↓
+Practice Controller (Luau)   transport state machine, A-B range, count-in, speed
+  ↓
+Score Engine (alphaTab)      layout, MIDI, note semantics, PNG systems, WAV
+  ↓
+Audio Engine (mpv + IPC)     playback, seek, speed, loop, authoritative time-pos
+```
+
+Luau never synthesises audio and never keeps its own playback clock.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `plugin.toml` | Manifest: blocks `score` and `library`, file associations |
+| `host.luau` | Blocks: rendering orchestration, hit boxes, transport, selection export |
+| `window.luau` | Window commands, split layout, agent request poller |
+| `hits.css` | Coordinate classes (`.gx`/`.gy`/`.gw`/`.gh`), cursor, toolbar, library |
+| `renderer/index.mjs` | alphaTab → PNG systems + note/beat bounds + `full.wav` + `count_in.wav` |
+| `audio_backend.py` | Resident mpv process + JSON IPC over a Windows named pipe |
+| `pickfile.py` | Native Windows file dialog, filtered to score formats |
+
+`player.py` and `slice.py` are retired: mpv seeks natively, so pre-sliced segments are no longer
+needed.
+
+## Agent interface
+
+Drop a request file in the plugin data directory; the window half polls it every 400 ms.
+
+```jsonc
+// <plugin data>/open-request.json
+{"file": "D:/scores/study.gp5"}     // open one score beside the focused pane
+{"root": "D:/scores"}               // every score in a folder, one pane each
+{"library": "D:/scores"}            // the library picker at that folder
+{"dump": true}                      // write the current pane list to panes.txt
+{"close": [123, 456]}               // close panes by id
+```
+
+Selecting bars in a score writes `<plugin data>/selection.json`:
+
+```jsonc
+{
+  "version": "1.1.0",
+  "protocol": "music_context_v1",
+  "path": "...", "title": "...",
+  "bars": [4, 7],
+  "playback_range_ms": {"t0": 12470, "t1": 24940},
+  "tempo_bpm": 77, "median_beat_ms": 390,
+  "time_signature": [4, 4], "tuning_midi": [40, 45, 50, 55, 59, 64],
+  "notes": [{"id": 1234, "bar": 4, "string": 6, "fret": 0, "midi": 40,
+             "duration_ticks": 480, "is_tie": false, "is_hammer_pull": false,
+             "is_slide": false, "is_ghost": false, "is_dead": false}],
+  "beats": [{"t": 12470, "beat_ids": [12]}]
+}
+```
+
+## Running
+
+```bash
+# Layout + audio for one score
+node renderer/index.mjs --input score.gp5 --out <cache dir> --width 800
+
+# The resident audio backend (started by the plugin; runnable standalone for testing)
+python audio_backend.py <cache dir>
+```
+
+The plugin start sends commands by appending JSONL to `<cache dir>/audio_cmd.jsonl`; the backend
+consumes the file atomically and reports state in `audio_state.json` every 30 ms.
+
+## Tests
+
+```bash
+python tests/test_audio_backend.py     # audio engine: burst commands, speed ratio, pause survival, A-B loop
+node renderer/index.mjs ...            # engine smoke: 8 formats render with notes + audio
+```
+
+## Known limits
+
+- No automatic scrolling yet: the active system row is highlighted (`role="score-active"`) and
+  carries `scroll-margin-top`, but nothing scrolls it into view.
+- Count-in length assumes one tempo for the first bar; 6/8 and other compound metres need the
+  time signature's beat unit rather than the numerator.
+- Viewport width changes re-render into a separate cache directory (`<score>@<width>`) but the
+  open pane does not re-request a render at its new width.

@@ -242,8 +242,10 @@ end
 
 -- playback -----------------------------------------------------------------
 
+-- append-only JSONL queue: a single-slot file loses commands when the
+-- backend has not read the previous one yet (load -> speed -> loop)
 local function cmdFile(sc: Score): string
-	return sc.out .. "/audio_cmd.json"
+	return sc.out .. "/audio_cmd.jsonl"
 end
 
 local function stateFile(sc: Score): string
@@ -251,12 +253,28 @@ local function stateFile(sc: Score): string
 end
 
 local function sendCmd(sc: Score, payload: any)
-	pcall(tern.fs.write, cmdFile(sc), tern.json.encode(payload))
+	local line = tern.json.encode(payload, false):gsub("\n", "") .. "\n"
+	local ok, existing = pcall(tern.fs.read, cmdFile(sc))
+	local prev = if ok then existing else ""
+	-- the backend truncates the file; a stale tail would replay old commands
+	if #prev > 262144 then
+		prev = ""
+	end
+	pcall(tern.fs.write, cmdFile(sc), prev .. line)
 end
 
 local function ensureBackend(sc: Score)
 	if sc.backendRunning then
-		return
+		local ok, text = pcall(tern.fs.read, stateFile(sc))
+		if ok and text ~= "" then
+			local okj, data = pcall(tern.json.decode, text)
+			if okj and type(data) == "table" and data.heartbeat ~= nil then
+				local delta = math.abs(tern.now() - data.heartbeat)
+				if delta < 6000 then
+					return
+				end
+			end
+		end
 	end
 	pcall(tern.fs.write, hbFile(sc), tostring(math.floor(tern.now())))
 	pcall(function()
@@ -303,11 +321,15 @@ local function startAudioLoop(state: State, cx: any, sc: Score)
 		if session ~= sc.session then
 			return
 		end
+		-- Keep the backend alive even while paused: if the heartbeat stops the
+		-- watchdog reaps mpv and a later resume has nothing to play into.
+		pcall(tern.fs.write, hbFile(sc), tostring(math.floor(tern.now())))
 		if not sc.playing and not sc.countInActive then
+			if sc.backendRunning then
+				tern.timer(300, tick)
+			end
 			return
 		end
-		-- Update heartbeat to keep backend alive
-		pcall(tern.fs.write, hbFile(sc), tostring(math.floor(tern.now())))
 		
 		-- Read true audio clock from backend state file
 		local ok, text = pcall(tern.fs.read, stateFile(sc))
@@ -430,8 +452,12 @@ local function applyJson(cx: any, sc: Score, data: any)
 		end
 		local notes: { Note } = {}
 		for _, n in ipairs(s.notes or {}) do
-			n.id = id
-			id = id + 1
+			-- the renderer's stableId is the identity the agent protocol exports,
+			-- so keep it; only a payload without one falls back to a running index
+			if n.id == nil then
+				n.id = id
+			end
+			id = math.max(id, n.id + 1)
 			table.insert(notes, n)
 		end
 		table.insert(sc.systems, {
@@ -768,7 +794,8 @@ local def: BlockDef<State> = {
 			return
 		end
 		if act == "playpause" or act == "stop" or act == "home" or act == "back"
-			or act == "fwd" or act == "loop" or act == "speed_cycle" then
+			or act == "fwd" or act == "loop" or act == "speed_cycle"
+			or act == "count_in_toggle" then
 			local sc0 = state.scores[state.active]
 			if sc0 == nil or sc0.status ~= "ready" then
 				return
