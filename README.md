@@ -3,36 +3,30 @@
 Interactive guitar tablature player and practice companion for [Tern](https://docs.stencil.so/tern/),
 built on alphaTab (layout + SoundFont synthesis) and a resident mpv audio engine.
 
+![Original score and two generated practice drafts open side by side](assets/gscore-workspace.png)
+
 ## What it does
 
-- **Formats.** `.musicxml`, `.xml`, `.mxl`, `.gp`, `.gp3`, `.gp4`, `.gp5`, `.gpx` — all eight
-  verified end to end (import → render → audio → interactive notes).
-- **Real audio.** alphaTab's bundled Sonivox SoundFont is exported offline to a 44.1 kHz stereo
-  WAV with peak normalisation and a `tanh` soft limiter (no clipped samples).
-- **True audio clock.** Playback state comes from mpv's `time-pos`, not a Luau timer, so the
-  cursor cannot drift away from what you hear.
-- **Transport.** Play/pause, stop, ±5 s seek, bar-range loop, click-a-note-to-seek, and a
-  pitch-preserving speed cycle (0.75× / 1.0× / 1.25×) via mpv's `scaletempo2`.
-- **Count-in.** One bar of metronome clicks (accented downbeat) rendered per score, played
-  before the first real beat.
-- **Multi-score layout.** Several scores side by side in split panes, each with its own
-  transport.
-- **Agent channel.** `selection.json` (`music_context_v1`) exports the selected bars as
-  structured music: stable note ids, string/fret, absolute MIDI, durations, tuplets, ties,
-  hammer-ons, slides, tuning and time signature.
+- **Import & inspect.** Open `.musicxml`, `.xml`, `.mxl`, `.gp`, `.gp3`, `.gp4`, `.gp5`, and `.gpx`; all eight are exercised end to end (import, render, audio, interactive notes).
+- **Play.** alphaTab's bundled Sonivox SoundFont produces normalized 44.1 kHz stereo WAV; mpv supplies the audio clock, transport, note seek, measure and A–B loops, and pitch-preserving 0.75×/1.0×/1.25× speed.
+- **Count and keep time.** Use a one-bar count-in or toggle the live metronome while playing.
+- **Generate practice.** Turn selected measures into alternate-picking, arpeggio, or slow-drill MusicXML; each request keeps its own selection snapshot.
+- **Compare and follow.** Keep the source and multiple drafts open side by side; linked measures stay aligned, playback reveals the current system, and resizing reflows notation without regenerating audio.
+- **Mix.** Mute or solo separable MIDI tracks; the live metronome follows the current track mix.
+- **Agent context.** `selection.json` (`music_context_v1`) exports stable note ids, string/fret, absolute MIDI, durations, tuplets, ties, hammer-ons, slides, tuning, and time signature.
 
 ## Architecture
 
 Four layers, each owning one concern:
 
 ```
-Tern Native UI (Luau)        shots, hit boxes, cursor, toolbar, split panes
+Tern Native UI (Luau)        score panes, hit boxes, toolbar, viewport links
   ↓
-Practice Controller (Luau)   transport state machine, A-B range, count-in, speed
+Practice Controller (Luau)   transport, measure links, follow, mix state
   ↓
-Score Engine (alphaTab)      layout, MIDI, note semantics, PNG systems, WAV
+Score Engine (alphaTab)      layout, MIDI, PNG systems, WAV stems and click
   ↓
-Audio Engine (mpv + IPC)     playback, seek, speed, loop, authoritative time-pos
+Audio Engine (mpv + IPC)     playback, seek, speed, loop, transport-preserving mix
 ```
 
 Luau never synthesises audio and never keeps its own playback clock.
@@ -45,7 +39,7 @@ Luau never synthesises audio and never keeps its own playback clock.
 | `host.luau` | Blocks: rendering orchestration, hit boxes, transport, selection export |
 | `window.luau` | Window commands, split layout, agent request poller |
 | `hits.css` | Coordinate classes (`.gx`/`.gy`/`.gw`/`.gh`), cursor, toolbar, library |
-| `renderer/index.mjs` | alphaTab → PNG systems + note/beat bounds + `full.wav` + `count_in.wav` |
+| `renderer/index.mjs` | alphaTab → PNG systems + note/beat bounds + `full.wav` + `count_in.wav` + `track-N.wav` stems + `metronome.wav` + `tracks.json` |
 | `audio_backend.py` | Resident mpv process + JSON IPC over a Windows named pipe |
 | `pickfile.py` | Native Windows file dialog, filtered to score formats |
 
@@ -69,7 +63,10 @@ The companion turns selected measures into practice variations that open side by
 4. **Practice & compare**:
    - The variation opens as a split pane beside the original score labeled `[Draft]`.
    - Existing panes are preserved (never closed) so original and variations stay side by side.
-   - Both original and drafts can be independently played, looped, auditioned, or modified.
+   - Each score pane keeps its own transport and audio backend; drafts can be played, looped,
+     auditioned, or modified without replacing the other panes.
+
+The generators are deterministic MusicXML templates; “Agent” refers to the request channel, not LLM-authored composition.
 
 ```bash
 # Generate an alternate-picking study at 60 BPM and open beside the original
@@ -81,6 +78,17 @@ python tools/generate_draft.py --template arpeggio --bpm 72 --open
 # Slow drill: preserve the source rhythm at the requested slower tempo
 python tools/generate_draft.py --template slow_drill --bpm 50 --open
 ```
+
+## P3 Practice UX
+
+- Playback reveals the system containing the current measure, including rests; source and draft bars
+  share a link keyed by the source pane and selected range.
+- Pane resize re-renders notation at the new width into a revision-specific image directory. Audio
+  remains in a per-pane directory and is not regenerated for layout-only resizes.
+- The renderer exports an aligned click-only metronome stem. Toggling it mixes against the current
+  track selection while preserving playback position, speed, pause state and A-B loop.
+- Per-track Mute/Solo appears only when alphaTab reports disjoint MIDI channel sets; shared channels
+  cannot be reliably separated.
 
 ## Agent interface
 
@@ -117,10 +125,10 @@ Selecting bars in a score writes `<plugin data>/selection.json`:
 
 ```bash
 # Layout + audio for one score
-node renderer/index.mjs --input score.gp5 --out <cache dir> --width 800
+node renderer/index.mjs --input score.gp5 --out render --audio-out audio --width 800
 
 # The resident audio backend (started by the plugin; runnable standalone for testing)
-python audio_backend.py <cache dir>
+python audio_backend.py audio
 ```
 
 The plugin writes each command to an ordered file under `<cache dir>/cmds/`, followed by
@@ -130,23 +138,23 @@ atomically to `audio_state.json` every 30 ms.
 
 ## Tests
 
-All three suites run against the repo-local fixture `tests/fixtures/sample.musicxml`, so they need no
-private paths.
+All four suites use the repo-local fixture (the renderer stem test derives a two-track score from it),
+so they need no private paths.
 
 ```bash
-python tests/test_audio_backend.py     # burst queue, 1.25x ratio, 6s pause watchdog
-python tests/test_concurrency.py       # sentinel recovery, repeated/corrupt commands, monotonic seq,
-                                       # A-B bounds, 10s pause/resume, zero orphan mpv
-python tests/test_interactive_workflow.py # P2 end-to-end: selection -> generate draft -> render -> play
+python tests/test_renderer_audio.py     # separate track stems, click stem, resize-safe audio output
+python tests/test_audio_backend.py      # count-in loop reset, live mix, speed ratio, pause watchdog
+python tests/test_concurrency.py        # sentinel recovery, repeated/corrupt commands, A-B bounds,
+                                        # pause/resume, zero orphan mpv
+python tests/test_interactive_workflow.py # P2 selection -> generation -> render -> playback
 ```
 
 
 ## Known limits
 
-- Viewport follow issues a TSP `["reveal", key, "nearest"]` frame op when the active system
-  changes, and the active row carries `role="score-active"` as a fallback highlight. The reveal
-  path has not been verified against a live Tern window yet.
-- Count-in length assumes one tempo for the first bar; 6/8 and other compound metres need the
-  time signature's beat unit rather than the numerator.
-- Viewport width changes re-render into a separate cache directory (`<score>@<width>`) but the
-  open pane does not re-request a render at its new width.
+- Automated suites cover rendering, generation, and audio, but not Tern's native UI. P3 `reveal`,
+  resize, toolbar, and source/draft links have been manually checked in a live host; they remain
+  manual acceptance rather than CI coverage.
+- Count-in length uses the first bar's numerator and initial tempo; compound metres and tempo changes
+  in the count-in bar need separate validation.
+- Mute/Solo is unavailable when MIDI channels overlap between tracks.

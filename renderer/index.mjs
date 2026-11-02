@@ -1,5 +1,5 @@
-// alphaTab -> per-system PNGs + note/beat bounds + whole-piece WAV + per-pitch WAV.
-// Usage: node index.mjs --input score.musicxml --out DIR [--width 1000]
+// alphaTab -> per-system PNGs + note/beat bounds + whole-piece WAV + per-track WAV stems + click-only metronome.
+// Usage: node index.mjs --input score.musicxml --out DIR [--audio-out DIR] [--no-audio] [--width 1000]
 import * as alphaTab from "@coderline/alphatab";
 import * as alphaSkia from "@coderline/alphaskia";
 import * as fs from "fs";
@@ -13,12 +13,15 @@ const arg = (name, dflt) => {
 
 const input = arg("input");
 const outDir = arg("out", "out");
+const audioOut = arg("audio-out", outDir);
+const noAudio = process.argv.includes("--no-audio");
 const width = Number(arg("width", "1000"));
 if (!input) {
   console.error("missing --input");
   process.exit(2);
 }
 fs.mkdirSync(outDir, { recursive: true });
+fs.mkdirSync(audioOut, { recursive: true });
 
 alphaTab.Environment.enableAlphaSkia(
   fs.readFileSync(path.join(here, "node_modules/@coderline/alphatab/dist/font/Bravura.otf")).buffer,
@@ -248,10 +251,14 @@ chunks.forEach((c, i) => {
 });
 
 // ---------- audio: alphaTab's SoundFont synth (sonivox), exported offline
+// Stems reuse one render helper; full mix is rendered once, a single shared
+// gain (derived from the full mix peak) scales every stem so stem gains stay
+// consistent with the full mix instead of being normalized independently.
 const M2 = alphaTab.midi;
 const sfPath = path.join(here, "node_modules/@coderline/alphatab/dist/soundfont/sonivox.sf2");
 const sfBytes = new Uint8Array(fs.readFileSync(sfPath));
 
+const SR = 44100;
 const silent = () => {
   const listeners = [];
   return {
@@ -261,70 +268,136 @@ const silent = () => {
   };
 };
 const output = {
-  sampleRate: 44100,
+  sampleRate: SR,
   open() {}, play() {}, pause() {}, resume() {}, destroy() {}, seek() {},
   get volume() { return 1; }, set volume(_v) {},
   ready: silent(), samplesPlayed: silent(), finished: silent(), sampleRequest: silent(),
 };
-
 const synth = new alphaTab.synth.AlphaSynth(output, 200);
 await synth.loadSoundFont(sfBytes, false);
-const exporter = await synth.exportAudio({
-  soundFonts: [sfBytes],
-  sampleRate: 44100,
-  useSyncPoints: false,
-  masterVolume: 1,
-  metronomeVolume: 0,
-  trackVolume: new Map(),
-  trackTranspositionPitches: new Map(),
-}, midiFile, [], new Map());
 
-const frames = [];
-let maxAbs = 0;
-for (;;) {
-  const chunk = exporter.render(1000);
-  if (!chunk) break;
-  frames.push(chunk.samples);
-  for (const v of chunk.samples) if (Math.abs(v) > maxAbs) maxAbs = Math.abs(v);
-}
-// normalize to -1 dBFS headroom, then soft-clip: the synth can sum past 0 dBFS
-let peakAbs = 0;
-for (const f of frames) for (const v of f) if (Math.abs(v) > peakAbs) peakAbs = Math.abs(v);
-// ponytail: plain peak normalize + tanh limiter; upgrade to a look-ahead limiter if pumping shows
-const gain = peakAbs > 0 ? Math.min(1, 0.891 / peakAbs) : 1;
-const pcm = Buffer.alloc(frames.reduce((a, f) => a + f.length, 0) * 2);
-let off = 0;
-for (const f of frames) {
-  for (let i = 0; i < f.length; i++) {
-    const v = Math.tanh(f[i] * gain);
-    pcm.writeInt16LE(Math.round(v * 32767), off);
-    off += 2;
+const writeWav = (file, frames, channels) => {
+  const total = frames.reduce((a, f) => a + f.length, 0);
+  const pcm = Buffer.alloc(total * 2);
+  let off = 0;
+  for (const f of frames) {
+    for (let i = 0; i < f.length; i++) {
+      pcm.writeInt16LE(Math.round(f[i] * 32767), off);
+      off += 2;
+    }
   }
+  const head = Buffer.alloc(44);
+  head.write("RIFF", 0);
+  head.writeUInt32LE(36 + pcm.length, 4);
+  head.write("WAVE", 8);
+  head.write("fmt ", 12);
+  head.writeUInt32LE(16, 16);
+  head.writeUInt16LE(1, 20);
+  head.writeUInt16LE(channels, 22);
+  head.writeUInt32LE(SR, 24);
+  head.writeUInt32LE(SR * channels * 2, 28);
+  head.writeUInt16LE(channels * 2, 32);
+  head.writeUInt16LE(16, 34);
+  head.write("data", 36);
+  head.writeUInt32LE(pcm.length, 40);
+  fs.writeFileSync(file, Buffer.concat([head, pcm]));
+};
+const renderExport = async (opts) => {
+  const exporter = await synth.exportAudio({
+    soundFonts: [sfBytes],
+    sampleRate: SR,
+    useSyncPoints: false,
+    masterVolume: 1,
+    metronomeVolume: 0,
+    trackVolume: new Map(),
+    trackTranspositionPitches: new Map(),
+    ...opts,
+  }, midiFile, [], new Map());
+  const frames = [];
+  let peak = 0;
+  for (;;) {
+    const chunk = exporter.render(1000);
+    if (!chunk) break;
+    frames.push(chunk.samples);
+    for (const v of chunk.samples) if (Math.abs(v) > peak) peak = Math.abs(v);
+  }
+  return { frames, peak };
+};
+const scaleFrames = (frames, gain) => frames.map((f) => {
+  const out = new Float32Array(f.length);
+  for (let i = 0; i < f.length; i++) out[i] = Math.tanh(f[i] * gain);
+  return out;
+});
+
+let fullSamples = 0;
+let fullPeakAbs = 0;
+let tracksManifest = [];
+// Track metadata is needed by the host even when a resize skips audio rendering.
+const trackChannels = score.tracks.map((t) => {
+  const chans = [t.playbackInfo.primaryChannel, t.playbackInfo.secondaryChannel]
+    .filter((c) => c !== undefined && c !== null);
+  return [...new Set(chans)];
+});
+tracksManifest = score.tracks.map((t, i) => ({
+  index: i,
+  name: t.name || ("Track " + (i + 1)),
+  channels: trackChannels[i],
+}));
+const allChannels = [...new Set(trackChannels.flat())];
+
+if (!noAudio) {
+  // full mix first: its peak sets the one shared gain for every stem
+  const full = await renderExport({});
+  fullPeakAbs = full.peak;
+  fullSamples = full.frames.reduce((a, f) => a + f.length, 0);
+  // ponytail: plain peak normalize + tanh limiter; upgrade to a look-ahead limiter if pumping shows
+  const gain = fullPeakAbs > 0 ? Math.min(1, 0.891 / fullPeakAbs) : 1;
+  writeWav(path.join(audioOut, "full.wav"), scaleFrames(full.frames, gain), 2);
+
+  // per-track stems: solo that track's channels via trackVolume (midi-channel keys)
+  for (let i = 0; i < score.tracks.length; i++) {
+    const solo = trackChannels[i];
+    if (!solo.length) continue;
+    const trackVolume = new Map();
+    for (const c of allChannels) trackVolume.set(c, solo.includes(c) ? 1 : 0);
+    const stem = await renderExport({ trackVolume });
+    writeWav(path.join(audioOut, `track-${i}.wav`), scaleFrames(stem.frames, gain), 2);
+  }
+
+  // click-only metronome stem: mute every track channel, render the synth
+  // metronome alone. Same frame length as the full mix so hosts can swap it in.
+  {
+    const trackVolume = new Map();
+    for (const c of allChannels) trackVolume.set(c, 0);
+    const click = await renderExport({ trackVolume, metronomeVolume: 1 });
+    let clickFrames = click.frames.map((f) => Float32Array.from(f));
+    const got = clickFrames.reduce((a, f) => a + f.length, 0);
+    if (!clickFrames.length || got < fullSamples) {
+      const pad = new Float32Array(fullSamples - got);
+      clickFrames = clickFrames.length ? [...clickFrames, pad] : [pad];
+    } else if (got > fullSamples) {
+      let keep = fullSamples;
+      clickFrames = clickFrames.flatMap((f) => {
+        if (keep <= 0) return [];
+        const cut = f.subarray(0, keep);
+        keep -= cut.length;
+        return [cut];
+      });
+    }
+    writeWav(path.join(audioOut, "metronome.wav"), clickFrames, 2);
+  }
+
+  fs.writeFileSync(path.join(audioOut, "tracks.json"), JSON.stringify({ tracks: tracksManifest }, null, 1));
 }
-const head = Buffer.alloc(44);
-head.write("RIFF", 0);
-head.writeUInt32LE(36 + pcm.length, 4);
-head.write("WAVE", 8);
-head.write("fmt ", 12);
-head.writeUInt32LE(16, 16);
-head.writeUInt16LE(1, 20);
-head.writeUInt16LE(2, 22);
-head.writeUInt32LE(44100, 24);
-head.writeUInt32LE(44100 * 4, 28);
-head.writeUInt16LE(4, 32);
-head.writeUInt16LE(16, 34);
-head.write("data", 36);
-head.writeUInt32LE(pcm.length, 40);
-fs.writeFileSync(path.join(outDir, "full.wav"), Buffer.concat([head, pcm]));
 
 // ---------- count-in click track (1 bar of metronome ticks)
-{
+if (!noAudio) {
   const firstBar = score.masterBars[0];
   const bpm = (marks.find(m => m.tick === 0) || {}).tempo || score.tempo || 120;
   const beatsPerBar = firstBar ? firstBar.timeSignatureNumerator : 4;
   const beatMs = 60000 / bpm;
   const barMs = beatMs * beatsPerBar;
-  const CLICK_SR = 44100;
+  const CLICK_SR = SR;
   const total = Math.floor((barMs / 1000) * CLICK_SR);
   const clickPcm = new Int16Array(total);
   const tickSamples = Math.floor(0.03 * CLICK_SR);
@@ -356,14 +429,16 @@ fs.writeFileSync(path.join(outDir, "full.wav"), Buffer.concat([head, pcm]));
   cHead.writeUInt16LE(16, 34);
   cHead.write("data", 36);
   cHead.writeUInt32LE(clickPcmBuf.length, 40);
-  fs.writeFileSync(path.join(outDir, "count_in.wav"), Buffer.concat([cHead, clickPcmBuf]));
+  fs.writeFileSync(path.join(audioOut, "count_in.wav"), Buffer.concat([cHead, clickPcmBuf]));
 }
 
 
 console.log(JSON.stringify({
   ok: true,
   title: score.title || path.basename(input),
-  duration: Math.round((pcm.length / 4 / 44100) * 1000),
+  duration: noAudio
+    ? (measureTimes.length ? measureTimes[measureTimes.length - 1].t1 : 0)
+    : Math.round((fullSamples / 2 / SR) * 1000),
   tuning: (score.tracks[0] && score.tracks[0].staves[0] && score.tracks[0].staves[0].stringTuning
     ? score.tracks[0].staves[0].stringTuning.tunings.slice() : []),
   timeSignature: score.masterBars[0]
@@ -372,7 +447,9 @@ console.log(JSON.stringify({
     const first = marks.find(m => m.tick === 0);
     return first ? first.tempo : (score.tempo || 120);
   })(),
-  peak: Number(maxAbs.toFixed(3)),
+  peak: Number(fullPeakAbs.toFixed(3)),
+  tracks: tracksManifest,
+  audioOut: noAudio ? null : audioOut,
   timeline,
   measureTimes,
   systems,

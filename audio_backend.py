@@ -1,3 +1,4 @@
+import array
 import atexit
 import json
 import os
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 import win32file
 import win32job
 import win32pipe
@@ -25,6 +27,8 @@ Concurrency & Robustness:
       - `seq`: int (strictly incrementing on each state tick)
       - `pos_ms`, `duration_ms`, `speed`, `playing`, `paused`, `loop`, `loop_a_ms`, `loop_b_ms`
   - Non-blocking PeekNamedPipe reader loop.
+  - mix: sum enabled stems (+optional metronome) to a reference-length PCM16 WAV,
+    published atomically; playback position, speed, A-B loop, and pause state survive.
   - load_generation tracked seek: ensures seek after loadfile is never dropped or misattributed.
 """
 
@@ -167,7 +171,7 @@ class MpvController:
                                 self.file_loaded = True
                                 self._dispatch_pending_seek()
                             elif event == "playback-restart":
-                                self.state["playing"] = True
+                                self.state["playing"] = not self.state.get("paused", False)
                                 self._dispatch_pending_seek()
                             elif event == "end-file":
                                 self.state["playing"] = False
@@ -248,6 +252,20 @@ class MpvController:
             self.state["loop_a_ms"] = None
             self.state["loop_b_ms"] = None
 
+    def mix_stems(self, files, reference, output):
+        pos_ms = max(0, int(self.state.get("pos_ms", 0)))
+        speed = float(self.state.get("speed", 1.0))
+        paused = bool(self.state.get("paused", True))
+        loop = bool(self.state.get("loop", False))
+        loop_a = self.state.get("loop_a_ms")
+        loop_b = self.state.get("loop_b_ms")
+        mix_wav_files(files or [], reference, output)
+        self.load_file(output, start_ms=pos_ms, paused=paused)
+        self.set_speed(speed)
+        if loop and loop_a is not None and loop_b is not None:
+            self.set_ab_loop(loop_a, loop_b)
+        return output
+
     def poll_time(self):
         self._send_command(["get_property", "time-pos"])
 
@@ -275,6 +293,89 @@ class MpvController:
                 except Exception:
                     pass
 
+_MIX_CHUNK_FRAMES = 32768  # ~0.7 s of stereo16; bounds mix memory regardless of song length
+
+
+def mix_wav_files(files, reference, output):
+    """Sum PCM16 WAV stems into one reference-length file, atomically.
+
+    `files` holds enabled stem paths (track stems plus optional metronome
+    stem); an empty list yields reference-length silence. Every stem must
+    match the reference (channels, sample width, frame rate, compression)
+    or ValueError is raised and nothing is written. Output goes to a temp
+    file first, then `os.replace`, so mpv never loads a partial WAV.
+    Frames stream in bounded chunks; over-long stems truncate, short ones
+    pad with silence, and summed samples hard-clip to int16.
+    """
+    if not reference:
+        raise ValueError("mix requires a reference wav path")
+    if not output:
+        raise ValueError("mix requires an output wav path")
+    try:
+        ref = wave.open(reference, "rb")
+    except (OSError, wave.Error) as e:
+        raise ValueError(f"bad reference wav {reference!r}: {e}")
+    with ref:
+        nchannels, sampwidth, framerate, nframes, comptype, _compname = ref.getparams()
+        if comptype != "NONE" or sampwidth != 2:
+            raise ValueError(f"unsupported reference format ({comptype}, width={sampwidth}); need PCM16")
+        stems = []
+        try:
+            for path in files or []:
+                try:
+                    w = wave.open(path, "rb")
+                except (OSError, wave.Error) as e:
+                    raise ValueError(f"bad stem wav {path!r}: {e}")
+                p = w.getparams()
+                if (p.nchannels, p.sampwidth, p.framerate, p.comptype) != (nchannels, sampwidth, framerate, comptype):
+                    w.close()
+                    raise ValueError(
+                        f"incompatible stem {path!r}: "
+                        f"{p.nchannels}ch/{p.sampwidth}B/{p.framerate}Hz vs "
+                        f"ref {nchannels}ch/{sampwidth}B/{framerate}Hz"
+                    )
+                stems.append(w)
+            tmp = output + ".tmp"
+            try:
+                with wave.open(tmp, "wb") as out:
+                    out.setnchannels(nchannels)
+                    out.setsampwidth(sampwidth)
+                    out.setframerate(framerate)
+                    width = nchannels * sampwidth
+                    remaining = nframes
+                    while remaining > 0:
+                        n = min(_MIX_CHUNK_FRAMES, remaining)
+                        acc = array.array("i", [0]) * (n * nchannels)
+                        for w in stems:
+                            raw = w.readframes(n)
+                            if len(raw) < n * width:
+                                raw += b"\x00" * (n * width - len(raw))
+                            s = array.array("h")
+                            s.frombytes(raw)
+                            if sys.byteorder != "little":
+                                s.byteswap()
+                            for i, v in enumerate(s):
+                                acc[i] += v
+                        mixed = array.array("h", (32767 if v > 32767 else -32768 if v < -32768 else v for v in acc))
+                        if sys.byteorder != "little":
+                            mixed.byteswap()
+                        out.writeframes(mixed.tobytes())
+                        remaining -= n
+                os.replace(tmp, output)
+            except BaseException:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+        finally:
+            for w in stems:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+    return output
+
 def execute_cmd_dict(controller, cmd_data):
     action = cmd_data.get("action")
     if action == "load":
@@ -298,6 +399,8 @@ def execute_cmd_dict(controller, cmd_data):
             cmd_data.get("loop_a_ms"),
             cmd_data.get("loop_b_ms")
         )
+    elif action == "mix":
+        controller.mix_stems(cmd_data.get("files"), cmd_data.get("reference"), cmd_data.get("output"))
     elif action == "quit":
         controller.shutdown()
         return False

@@ -12,15 +12,6 @@ local DRAFT_REQUESTS = tern.plugin.data .. "/draft_requests"
 local REQUEST_END_SENTINEL = "\n__GSCORE_END__\n"
 local POLL_MS = 400
 
--- Async process results wait here until poll provides a live SessionContext for UI work.
-type DraftResult = {
-	res: any,
-	outPath: string,
-	template: string,
-	bars: any,
-	sourcePane: any,
-}
-local draftResults: { DraftResult } = {}
 
 local function scoreFiles(dir: string): { string }
 	local out = {}
@@ -39,7 +30,7 @@ end
 local mine: { number } = {}
 
 
-local function openList(cx: any, files: { string }, isDraft: boolean?, preferredAnchor: any?)
+local function openList(cx: any, files: { string }, isDraft: boolean?, preferredAnchor: any?, draftLink: any?)
 	if #files == 0 then
 		cx:toast("error", "No score files")
 		return
@@ -81,6 +72,16 @@ local function openList(cx: any, files: { string }, isDraft: boolean?, preferred
 	tern.kv.set("panes", mine)
 	local a1 = { files[1] }
 	if isDraft then table.insert(a1, "draft") end
+	if isDraft and draftLink ~= nil then
+		local bars = draftLink.bars or {}
+		local sourcePane = draftLink.sourcePane
+		if preferredAnchor == nil or tostring(anchor) ~= tostring(preferredAnchor) then
+			sourcePane = nil
+		end
+		table.insert(a1, tostring(sourcePane or ""))
+		table.insert(a1, tostring(bars[1] or 0))
+		table.insert(a1, tostring(bars[2] or bars[1] or 0))
+	end
 	local column = cx.layout:split(anchor, "right", {
 		block = "gscore.score", args = a1,
 	})
@@ -166,13 +167,20 @@ local function processDraftRequest(cx: any, path: string, requestId: string)
 		"--bpm", bpm,
 		"--out", outPath,
 	}, { timeout_ms = 60000 }):next(function(res)
-		table.insert(draftResults, {
-			res = res,
-			outPath = outPath,
-			template = template,
-			bars = spec.bars,
-			sourcePane = spec.source_pane,
-		})
+		-- The process callback may outlive its original SessionContext.
+		tern.timer(1, function(cx2: any)
+			if not res or res.status ~= 0 or not tern.fs.exists(outPath) then
+				cx2:toast("error", "Draft generation failed",
+					res and (res.stderr ~= "" and res.stderr or res.stdout) or "no output")
+				return
+			end
+			cx2:toast("success", "Draft ready", template .. " · bars " ..
+				tostring((spec.bars or {})[1] or "?") .. "–" .. tostring((spec.bars or {})[2] or "?"))
+			openList(cx2, { outPath }, true, spec.source_pane, {
+				sourcePane = spec.source_pane,
+				bars = spec.bars,
+			})
+		end)
 	end)
 end
 
@@ -189,20 +197,6 @@ local function runDraftRequest(cx: any)
 	end
 end
 
-local function flushDraftResults(cx: any)
-	while #draftResults > 0 do
-		local result = table.remove(draftResults, 1)
-		local res = result.res
-		if not res or res.status ~= 0 or not tern.fs.exists(result.outPath) then
-			cx:toast("error", "Draft generation failed",
-				res and (res.stderr ~= "" and res.stderr or res.stdout) or "no output")
-		else
-			cx:toast("success", "Draft ready", result.template .. " · bars " ..
-				tostring((result.bars or {})[1] or "?") .. "–" .. tostring((result.bars or {})[2] or "?"))
-			openList(cx, { result.outPath }, true, result.sourcePane)
-		end
-	end
-end
 
 local function consume(cx: any)
 	local ok, text = pcall(tern.fs.read, REQUEST)
@@ -269,7 +263,6 @@ local function poll(cx: any)
 	if cx ~= nil then
 		pcall(consume, cx)
 		pcall(runDraftRequest, cx)
-		pcall(flushDraftResults, cx)
 	end
 	tern.timer(POLL_MS, poll)
 end

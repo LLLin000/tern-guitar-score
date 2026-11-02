@@ -53,9 +53,12 @@ type MeasureBox = { mb: number, x: number, y: number, w: number, h: number }
 type MeasureTime = { mb: number, t0: number, t1: number }
 type System = { png: string, w: number, h: number, blob: any, notes: { Note }, beats: { BeatBox }, measures: { MeasureBox } }
 
+type TrackInfo = { index: number, name: string, channels: { number } }
+
 type Score = {
 	path: string,
 	out: string,
+	renderOut: string,
 	title: string,
 	status: string,
 	err: string?,
@@ -93,9 +96,26 @@ type Score = {
 	timeline: { Occ },
 	measureTimes: { MeasureTime },
 	systems: { System },
+	audioReady: boolean,
+	tracks: { TrackInfo },
+	mutedTracks: { [number]: boolean },
+	soloTrack: number?,
+	metronome: boolean,
+	mixPath: string?,
+	linkedBar: number?,
+	lastPlaybackBar: number?,
 }
 
-type State = { scores: { Score }, active: number, width: number }
+type State = {
+	scores: { Score },
+	active: number,
+	width: number,
+	paneId: string,
+	sourcePane: string?,
+	sourceStart: number,
+	sourceEnd: number,
+	renderGeneration: number,
+}
 
 -- small helpers ------------------------------------------------------------
 
@@ -125,6 +145,18 @@ end
 -- boxes land, so a pane that grows must not reuse a narrower render
 local function cacheDir(path: string, width: number): string
 	return string.format("%s/cache/%s@%d", tern.plugin.data, path:gsub("[^%w]", "_"), width)
+end
+local function renderDir(path: string, width: number, revision: number): string
+	return cacheDir(path, width) .. "/r" .. tostring(revision)
+end
+
+local function renderWidth(cols: number, scoreCount: number): number
+	local perScore = math.floor(math.max(1, cols) * 8 / math.max(1, scoreCount))
+	return math.max(220, math.min(1040, perScore))
+end
+
+local function audioFile(sc: Score): string
+	return sc.mixPath or (sc.out .. "/full.wav")
 end
 
 local function newSession(): string
@@ -325,6 +357,7 @@ end
 local function playerStop(sc: Score)
 	sendCmd(sc, { action = "stop" })
 	sc.playing = false
+	sc.countInActive = false
 	sc.armed = false
 	sc.cur = {}
 end
@@ -337,6 +370,7 @@ end
 local function playerSeek(sc: Score, pos_ms: number)
 	sendCmd(sc, { action = "seek", pos_ms = math.floor(pos_ms) })
 	sc.pos = pos_ms
+	sc.lastPlaybackBar = nil
 end
 
 local function playerSpeed(sc: Score, speed: number)
@@ -348,27 +382,203 @@ local function playerLoop(sc: Score, a_ms: number?, b_ms: number?)
 	sendCmd(sc, { action = "loop", loop_a_ms = a_ms, loop_b_ms = b_ms })
 end
 
+local function independentlyMixable(sc: Score): boolean
+	if #sc.tracks < 2 then
+		return false
+	end
+	local channels: { [number]: boolean } = {}
+	for _, track in ipairs(sc.tracks) do
+		if #track.channels == 0 then
+			return false
+		end
+		for _, channel in ipairs(track.channels) do
+			if channels[channel] then
+				return false
+			end
+			channels[channel] = true
+		end
+	end
+	return true
+end
+
+local function requestMix(cx: any, sc: Score)
+	if not sc.audioReady then
+		return
+	end
+	local files = {}
+	if independentlyMixable(sc) then
+		for _, track in ipairs(sc.tracks) do
+			local enabled = not sc.mutedTracks[track.index]
+				and (sc.soloTrack == nil or sc.soloTrack == track.index)
+			if enabled then
+				table.insert(files, sc.out .. "/track-" .. tostring(track.index) .. ".wav")
+			end
+		end
+	else
+		table.insert(files, sc.out .. "/full.wav")
+	end
+	if sc.metronome then
+		table.insert(files, sc.out .. "/metronome.wav")
+	end
+	for _, file in ipairs(files) do
+		if not tern.fs.exists(file) then
+			cx:toast("error", "Audio mix unavailable", "Missing " .. file)
+			return
+		end
+	end
+	local stateKey = {}
+	for _, track in ipairs(sc.tracks) do
+		local enabled = not sc.mutedTracks[track.index]
+			and (sc.soloTrack == nil or sc.soloTrack == track.index)
+		table.insert(stateKey, tostring(track.index) .. (if enabled then "1" else "0"))
+	end
+	table.insert(stateKey, if sc.metronome then "m1" else "m0")
+	local output = sc.out .. "/mix-" .. table.concat(stateKey, "-")
+		.. "-" .. tostring(math.floor(tern.now())) .. "-" .. tostring(math.random(1000000)) .. ".wav"
+	sc.mixPath = output
+	ensureBackend(sc)
+	sendCmd(sc, {
+		action = "mix",
+		files = files,
+		reference = sc.out .. "/full.wav",
+		output = output,
+	})
+end
+
+local function linkKey(state: State): string?
+	local owner = state.sourcePane or state.paneId
+	if owner == "" then
+		return nil
+	end
+	return "gscore.measure-link." .. owner
+end
+
+local function publishLinkedBar(state: State, sc: Score, bar: number)
+	local key = linkKey(state)
+	if key == nil then
+		return
+	end
+	local sourceBar = if state.sourcePane ~= nil then state.sourceStart + bar else bar
+	sc.linkedBar = bar
+	local value = tern.json.encode({ bar = sourceBar }, false)
+	local ok, err = pcall(tern.kv.set, key, value)
+end
+
+local function measureAt(sc: Score, ms: number): number?
+	for _, mt in ipairs(sc.measureTimes) do
+		if ms >= mt.t0 and ms < mt.t1 then
+			return mt.mb
+		end
+	end
+	return nil
+end
+
+local function revealSystem(cx: any, index: number, sindex: number)
+	local key = string.format("main.scores.columns.score_%d.sys_%d_%d", index, index, sindex)
+	pcall(function()
+		cx:frame({ { "reveal", key, "nearest" } })
+	end)
+end
+
+local function revealMeasure(cx: any, index: number, sc: Score, bar: number)
+	for sindex, sys in ipairs(sc.systems) do
+		for _, measure in ipairs(sys.measures) do
+			if measure.mb == bar then
+				revealSystem(cx, index, sindex)
+				return
+			end
+		end
+	end
+end
+
+local function syncLinkedBar(state: State, cx: any, index: number, sc: Score): boolean
+	local key = linkKey(state)
+	if key == nil then
+		return false
+	end
+	local ok, raw = pcall(tern.kv.get, key)
+	if not ok or type(raw) ~= "string" then
+		return false
+	end
+	local okj, data = pcall(tern.json.decode, raw)
+	if not okj or type(data) ~= "table" or type(data.bar) ~= "number" then
+		return false
+	end
+	local bar: number? = data.bar
+	if state.sourcePane ~= nil then
+		if data.bar < state.sourceStart or data.bar > state.sourceEnd then
+			bar = nil
+		else
+			bar = data.bar - state.sourceStart
+		end
+	end
+	if bar ~= nil then
+		local found = false
+		for _, mt in ipairs(sc.measureTimes) do
+			if mt.mb == bar then
+				found = true
+				break
+			end
+		end
+		if not found then
+			bar = nil
+		end
+	end
+	if sc.linkedBar == bar then
+		return false
+	end
+	sc.linkedBar = bar
+	if bar ~= nil then
+		revealMeasure(cx, index, sc, bar)
+	end
+	return true
+end
+
+local function startLinkPoll(state: State, cx: any)
+	local function tick()
+		local changed = false
+		for index, sc in ipairs(state.scores) do
+			if syncLinkedBar(state, cx, index, sc) then
+				changed = true
+			end
+		end
+		if changed then
+			pcall(function() cx:render() end)
+		end
+		tern.timer(250, tick)
+	end
+	tern.timer(250, tick)
+end
+
 -- single polling loop per score: each invocation gets a unique `myToken`.
 -- If state restarts or resumes, previous loops observe token mismatch and exit cleanly.
 local function startAudioLoop(state: State, cx: any, sc: Score)
 	sc.loopToken = (sc.loopToken or 0) + 1
 	local myToken = sc.loopToken
 	local session = sc.session
+	local scoreIndex = state.active
+	for i, one in ipairs(state.scores) do
+		if one == sc then
+			scoreIndex = i
+			break
+		end
+	end
 	local lastSig = ""
 	local function tick()
 		if myToken ~= sc.loopToken or session ~= sc.session then
 			return
 		end
-		-- Keep backend alive even while paused
 		pcall(tern.fs.write, hbFile(sc), tostring(math.floor(tern.now())))
 		if not sc.playing and not sc.countInActive then
+			if syncLinkedBar(state, cx, scoreIndex, sc) then
+				cx:render()
+			end
 			if sc.backendRunning then
 				tern.timer(300, tick)
 			end
 			return
 		end
-		
-		-- Read true audio clock from backend state file
+
 		local ok, text = pcall(tern.fs.read, stateFile(sc))
 		if ok and text ~= "" then
 			local okj, data = pcall(tern.json.decode, text)
@@ -388,20 +598,31 @@ local function startAudioLoop(state: State, cx: any, sc: Score)
 						sc.countInActive = false
 						sc.playing = true
 						sc.pos = sc.from
-						local full = sc.out .. "/full.wav"
-						sendCmd(sc, { action = "load", file = full, pos_ms = math.floor(sc.from), paused = false })
+						sendCmd(sc, { action = "load", file = audioFile(sc), pos_ms = math.floor(sc.from), paused = false })
 						if sc.speed ~= 1.0 then
 							sendCmd(sc, { action = "speed", speed = sc.speed })
 						end
 						if sc.loop then
 							local a, b = loopRange(sc)
 							playerLoop(sc, a, b)
+						else
+							playerLoop(sc, nil, nil)
 						end
 					end
 				elseif data.playing ~= nil then
 					sc.playing = data.playing and not data.paused
 				end
 			end
+		end
+
+		local linkChanged = false
+		if not sc.countInActive then
+			local bar = measureAt(sc, sc.pos)
+			if bar ~= nil and bar ~= sc.lastPlaybackBar then
+				sc.lastPlaybackBar = bar
+				publishLinkedBar(state, sc, bar)
+			end
+			linkChanged = syncLinkedBar(state, cx, scoreIndex, sc)
 		end
 
 		sc.cur = beatsAt(sc, sc.pos)
@@ -411,29 +632,24 @@ local function startAudioLoop(state: State, cx: any, sc: Score)
 		end
 		table.sort(ids)
 		local sig = table.concat(ids, ",")
-				-- Viewport follow: when playback crosses to a new system row,
-		-- reveal it into view via TSP raw frame op ["reveal", nodeId, "nearest"]
+		local currentBar = measureAt(sc, sc.pos)
 		local activeSys: number? = nil
-		for sidx, sys in ipairs(sc.systems) do
-			for id in pairs(sc.cur) do
-				for _, b in ipairs(sys.beats) do
-					if b.i == id then
+		if currentBar ~= nil then
+			for sidx, sys in ipairs(sc.systems) do
+				for _, measure in ipairs(sys.measures) do
+					if measure.mb == currentBar then
 						activeSys = sidx
 						break
 					end
 				end
 				if activeSys ~= nil then break end
 			end
-			if activeSys ~= nil then break end
 		end
 		if activeSys ~= nil and activeSys ~= sc.lastActiveSys then
 			sc.lastActiveSys = activeSys
-			local nodeKey = string.format("sys_%d_%d", state.active, activeSys)
-			pcall(function()
-				cx:frame({ { "reveal", nodeKey, "nearest" } })
-			end)
+			revealSystem(cx, scoreIndex, activeSys)
 		end
-		if sig ~= lastSig then
+		if sig ~= lastSig or linkChanged then
 			lastSig = sig
 			cx:render()
 		end
@@ -456,10 +672,12 @@ local function playFrom(state: State, cx: any, sc: Score, from: number, to: numb
 	ensureBackend(sc)
 	sc.session = newSession()
 	sc.from, sc.to = from, to
+	sc.lastPlaybackBar = nil
 
-	-- count-in: 1 bar of metronome ticks before the real playback
+	-- The prior A-B loop belongs to the score, not to the count-in file.
 	local countInPath = sc.out .. "/count_in.wav"
 	if sc.countIn and from <= 0 and tern.fs.exists(countInPath) then
+		playerLoop(sc, nil, nil)
 		sc.countInActive = true
 		sc.playing = false
 		sc.pos = 0
@@ -473,7 +691,7 @@ local function playFrom(state: State, cx: any, sc: Score, from: number, to: numb
 	sc.pos = from
 	sc.playing = true
 
-	local full = sc.out .. "/full.wav"
+	local full = audioFile(sc)
 	sendCmd(sc, { action = "load", file = full, pos_ms = math.floor(from), paused = false })
 	if sc.speed ~= 1.0 then
 		sendCmd(sc, { action = "speed", speed = sc.speed })
@@ -490,20 +708,21 @@ local function playFrom(state: State, cx: any, sc: Score, from: number, to: numb
 	cx:render()
 end
 
-local function applyJson(cx: any, sc: Score, data: any)
+local function applyJson(cx: any, sc: Score, data: any, renderOut: string)
 	sc.title = data.title or "Score"
 	sc.tuning = data.tuning or {}
 	sc.tempoBpm = data.tempo_bpm or 120
 	sc.timeSignature = data.timeSignature or { 4, 4 }
 	sc.duration = data.duration or 0
 	sc.to = sc.duration
+	sc.tracks = data.tracks or {}
 	sc.systems = {}
 	sc.timeline = data.timeline or {}
 	sc.measureTimes = data.measureTimes or {}
 	local id = 0
 	for _, s in ipairs(data.systems) do
 		local blob: any = nil
-		local okb, bytes = pcall(tern.fs.read, sc.out .. "/" .. s.png)
+		local okb, bytes = pcall(tern.fs.read, renderOut .. "/" .. s.png)
 		if okb then
 			local okBlob, handle = pcall(function()
 				return cx:blob(bytes, "image/png")
@@ -514,8 +733,6 @@ local function applyJson(cx: any, sc: Score, data: any)
 		end
 		local notes: { Note } = {}
 		for _, n in ipairs(s.notes or {}) do
-			-- the renderer's stableId is the identity the agent protocol exports,
-			-- so keep it; only a payload without one falls back to a running index
 			if n.id == nil then
 				n.id = id
 			end
@@ -527,44 +744,72 @@ local function applyJson(cx: any, sc: Score, data: any)
 			beats = s.beats or {}, measures = s.measures or {},
 		})
 	end
+	sc.lastActiveSys = nil
 	sc.status = "ready"
 end
 
-local renderOne: (any, State, number) -> ()
+local renderOne: (any, State, number, number, boolean, number) -> ()
 
-function renderOne(cx: any, state: State, index: number)
+function renderOne(cx: any, state: State, index: number, revision: number, withAudio: boolean, width: number)
 	local sc = state.scores[index]
 	if not sc then
 		return
 	end
-	sc.status = "loading"
+	local renderOut = renderDir(sc.path, width, revision)
+	if revision == state.renderGeneration then
+		sc.renderOut = renderOut
+	end
+	if #sc.systems == 0 then
+		sc.status = "loading"
+	end
 	local argv = {
 		NODE, "index.mjs",
 		"--input", sc.path,
-		"--out", sc.out,
-		"--width", tostring(state.width),
+		"--out", renderOut,
+		"--audio-out", sc.out,
+		"--width", tostring(width),
 	}
+	if not withAudio then
+		table.insert(argv, "--no-audio")
+	end
+	local function failed(message: string)
+		if #sc.systems == 0 then
+			sc.status, sc.err = "error", message
+		else
+			cx:toast("error", "Score resize failed", message)
+		end
+	end
 	local started, startErr = pcall(function()
 		tern.process.run(argv, { cwd = tern.plugin.dir .. "/renderer", timeout_ms = 300000 }):next(function(res, runErr)
 			if runErr then
-				sc.status, sc.err = "error", tostring(runErr)
+				failed(tostring(runErr))
 			elseif not res or res.status ~= 0 then
-				sc.status = "error"
-				sc.err = (res and (res.stderr ~= "" and res.stderr or res.stdout)) or "renderer failed"
+				failed((res and (res.stderr ~= "" and res.stderr or res.stdout)) or "renderer failed")
 			else
 				local ok, data = pcall(tern.json.decode, res.stdout)
-				if not ok or type(data) ~= "table" or not data.systems then
-					sc.status, sc.err = "error", "bad renderer output"
+				if not ok or type(data) ~= "table" or type(data.systems) ~= "table" then
+					failed("bad renderer output")
 				else
-					applyJson(cx, sc, data)
+					if withAudio then
+						sc.audioReady = true
+					end
+					if revision == state.renderGeneration or #sc.systems == 0 then
+						local duration = sc.duration
+						applyJson(cx, sc, data, renderOut)
+						if not withAudio then
+							sc.duration, sc.to = duration, duration
+						end
+					end
 				end
 			end
 			cx:render()
-			renderOne(cx, state, index + 1)
+			if withAudio or revision == state.renderGeneration then
+				renderOne(cx, state, index + 1, revision, withAudio, width)
+			end
 		end)
 	end)
 	if not started then
-		sc.status, sc.err = "error", tostring(startErr)
+		failed(tostring(startErr))
 	end
 end
 
@@ -600,6 +845,14 @@ local function button(icon: string, act: string, tip: string, tone: string?): No
 	return node
 end
 
+local function badgeButton(text: string, act: string, tip: string, tone: string?): Node
+	local node = ui.node("badge", { text = text, tone = tone, title = tip })
+	local p: { [string]: any } = node.p or {}
+	p.actions = { click = act }
+	node.p = p
+	return node
+end
+
 local function column(state: State, index: number, sc: Score): Node
 	if sc.status == "error" then
 		return ui.col({
@@ -619,6 +872,9 @@ local function column(state: State, index: number, sc: Score): Node
 			local cls = "gmeas " .. box(m)
 			if sc.selA ~= nil and m.mb >= sc.selA and m.mb <= (sc.selB or sc.selA) then
 				cls = cls .. " gsel"
+			end
+			if sc.linkedBar == m.mb then
+				cls = cls .. " glink"
 			end
 			local mn = ui.el("div", { class = cls })
 			local mp: { [string]: any } = mn.p or {}
@@ -654,26 +910,38 @@ local function column(state: State, index: number, sc: Score): Node
 		}, hits))
 	end
 
-	return ui.el("div", { class = "gcol" }, rows)
+	return ui.el("div", { class = "gcol", key = "score_" .. tostring(index) }, rows)
 end
 
 local def: BlockDef<State> = {
 	init = function(cx: any, args: { string }, saved: any): State
 		local root = args[1] or (saved and saved.root) or ""
 		local files = if root == "" then {} else scoreFiles(root)
-		-- render at roughly the pane's pixel width so a narrow split pane keeps its text legible
 		local cols = tonumber(cx.cols) or 100
-		local width = math.max(380, math.min(1040, math.floor(cols * 8)))
-		if #files > 1 then
-			width = math.max(420, math.floor(1000 / #files))
+		local width = renderWidth(cols, #files)
+		local sourcePane = args[3]
+		if sourcePane == "" then sourcePane = nil end
+		local sourceStart = math.floor(tonumber(args[4]) or 0)
+		local sourceEnd = math.floor(tonumber(args[5]) or sourceStart)
+		local state: State = {
+			scores = {}, active = 1, width = width,
+			paneId = tostring(cx.pane or ""), sourcePane = sourcePane,
+			sourceStart = sourceStart, sourceEnd = sourceEnd, renderGeneration = 0,
+		}
+		if sourcePane == nil then
+			local key = linkKey(state)
+			if key then pcall(tern.kv.set, key, "") end
 		end
-		local state: State = { scores = {}, active = 1, width = width }
+		local paneCache = state.paneId
+		if paneCache == "" then paneCache = newSession() end
+		paneCache = paneCache:gsub("[^%w]", "_")
 		for _, path in ipairs(files) do
 			local isDraft = (args[2] == "draft") or (path:find("draft_") ~= nil)
 			local rawTitle = path:match("[^/\\]+$") or path
 			local sc: Score = {
 				path = path,
-				out = cacheDir(path, width),
+				out = cacheDir(path, 0) .. "/pane-" .. paneCache,
+				renderOut = renderDir(path, width, state.renderGeneration),
 				title = if isDraft then ("[Draft] " .. rawTitle) else rawTitle,
 				status = "loading",
 				err = nil,
@@ -711,6 +979,14 @@ local def: BlockDef<State> = {
 				timeline = {},
 				measureTimes = {},
 				systems = {},
+				audioReady = false,
+				tracks = {},
+				mutedTracks = {},
+				soloTrack = nil,
+				metronome = false,
+				mixPath = nil,
+				linkedBar = nil,
+				lastPlaybackBar = nil,
 			}
 			pcall(function()
 				tern.fs.mkdir(sc.out)
@@ -721,10 +997,35 @@ local def: BlockDef<State> = {
 		if #state.scores == 0 then
 			return state
 		end
-		renderOne(cx, state, 1)
+		renderOne(cx, state, 1, state.renderGeneration, true, state.width)
+		startLinkPoll(state, cx)
 		return state
 	end,
 
+	resize = function(state: State, cols: number, _rows: number, cx: any)
+		if #state.scores == 0 then return end
+		local width = renderWidth(tonumber(cols) or 44, #state.scores)
+		if width == state.width then return end
+		state.width = width
+		state.renderGeneration = state.renderGeneration + 1
+		local revision = state.renderGeneration
+		for _, sc in ipairs(state.scores) do
+			sc.renderOut = renderDir(sc.path, width, revision)
+		end
+		local function resizeWhenReady()
+			if revision ~= state.renderGeneration then return end
+			for _, sc in ipairs(state.scores) do
+				if not sc.audioReady then
+					if sc.status == "loading" then
+						tern.timer(200, resizeWhenReady)
+					end
+					return
+				end
+			end
+			renderOne(cx, state, 1, revision, false, width)
+		end
+		tern.timer(220, resizeWhenReady)
+	end,
 	title = function(state: State): string?
 		local sc = state.scores[state.active]
 		if not sc then
@@ -747,6 +1048,7 @@ local def: BlockDef<State> = {
 
 		local sc = state.scores[state.active]
 		local bar: { Node } = {}
+		local mixBar: { Node } = {}
 		if #state.scores > 1 then
 			for i, one in ipairs(state.scores) do
 				local node = ui.node("badge", {
@@ -771,21 +1073,37 @@ local def: BlockDef<State> = {
 			table.insert(bar, button("folder-open", "library", "Open a score file…"))
 			table.insert(bar, button("repeat", "loop", "Loop the selected bar",
 				if sc.loop then "accent" else "muted"))
-			-- Count-in toggle button
 			table.insert(bar, button("sparkle", "count_in_toggle", "Count-in: " .. (if sc.countIn then "ON" else "OFF"),
 				if sc.countIn then "accent" else "muted"))
-			-- Agent Draft button when bars are selected
 			if sc.selA ~= nil then
-				local barsLabel = tostring(sc.selA) .. "–" .. tostring(sc.selB or sc.selA)
-				table.insert(bar, button("wand", "agent_draft", "Ask Agent to create practice variation for bars " .. barsLabel, "accent"))
+				table.insert(bar, button("wand", "agent_draft",
+					"Ask Agent to create practice variation for bars " .. tostring(sc.selA) .. "–" .. tostring(sc.selB or sc.selA),
+					"accent"))
 			end
 			if sc.isDraft then
 				table.insert(bar, ui.node("badge", { text = "Agent Draft", tone = "accent", title = "AI-generated practice variation" }))
 			end
-			-- Speed button
 			local speedLabel = string.format("%.2fx", sc.speed or 1.0)
 			table.insert(bar, button("speed", "speed_cycle", "Speed: " .. speedLabel .. " (click to cycle 0.75x/1.0x/1.25x)"))
-			
+
+			if independentlyMixable(sc) then
+				table.insert(mixBar, ui.text({ ui.span("Tracks", "muted") }))
+				for _, track in ipairs(sc.tracks) do
+					local number = tostring(track.index + 1)
+					local muted = sc.mutedTracks[track.index] == true
+					local solo = sc.soloTrack == track.index
+					table.insert(mixBar, badgeButton("M" .. number, "track_mute=" .. tostring(track.index),
+						(if muted then "Unmute " else "Mute ") .. track.name, if muted then "accent" else "muted"))
+					table.insert(mixBar, badgeButton("S" .. number, "track_solo=" .. tostring(track.index),
+						(if solo then "Unsolo " else "Solo ") .. track.name, if solo then "accent" else "muted"))
+				end
+			end
+			if #sc.tracks > 0 then
+				table.insert(mixBar, badgeButton(if sc.metronome then "Click on" else "Click off",
+					"metronome_toggle", if sc.metronome then "Disable live metronome" else "Enable live metronome",
+					if sc.metronome then "accent" else "muted"))
+			end
+
 			local marks = ""
 			if sc.countInActive then
 				marks = "PREP... " .. clock(sc.pos)
@@ -799,10 +1117,20 @@ local def: BlockDef<State> = {
 			table.insert(bar, ui.text({ ui.span(marks, "muted") }))
 		end
 
+		local toolbar: { Node } = {
+			ui.el("div", { class = "gscore-toolbar" }, { ui.row(bar) }),
+		}
+		if #mixBar > 0 then
+			table.insert(toolbar, ui.el("div", { class = "gscore-mixer" }, { ui.row(mixBar) }))
+		end
+		local scoreRow = ui.row(cols)
+		local scoreRowProps: { [string]: any } = scoreRow.p or {}
+		scoreRowProps.key = "columns"
+		scoreRow.p = scoreRowProps
 		return {
 			main = ui.col({
-				ui.el("div", { class = "gscore-bar" }, { ui.row(bar) }),
-				ui.el("div", { class = "gcols" }, { ui.row(cols) }),
+				ui.el("div", { class = "gscore-bar" }, toolbar),
+				ui.el("div", { class = "gcols", key = "scores" }, { scoreRow }),
 			}),
 		}
 	end,
@@ -907,6 +1235,42 @@ local def: BlockDef<State> = {
 				tern.json.encode(reqPayload, true) .. END_SENTINEL)
 			cx:toast("info", "Draft requested",
 				"Bars " .. tostring(sc0.selA) .. "–" .. tostring(sc0.selB or sc0.selA) .. " · " .. tostring(sc0.draftTemplate or "alternate_picking"))
+			cx:render()
+			return
+		end
+		if act == "track_mute" or act == "track_solo" or act == "metronome_toggle" then
+			local sc0 = state.scores[state.active]
+			if sc0 == nil or sc0.status ~= "ready" then
+				return
+			end
+			if sc0.countInActive then
+				cx:toast("warning", "Wait for count-in to finish before changing the mix")
+				return
+			end
+			if act == "metronome_toggle" then
+				if #sc0.tracks == 0 then return end
+				sc0.metronome = not sc0.metronome
+			else
+				if not independentlyMixable(sc0) then return end
+				local trackIndex = tonumber(ev.value or "")
+				local found = false
+				for _, track in ipairs(sc0.tracks) do
+					if track.index == trackIndex then
+						found = true
+						break
+					end
+				end
+				if not found or trackIndex == nil then return end
+				if act == "track_mute" then
+					sc0.mutedTracks[trackIndex] = not sc0.mutedTracks[trackIndex]
+				elseif sc0.soloTrack == trackIndex then
+					sc0.soloTrack = nil
+				else
+					sc0.soloTrack = trackIndex
+				end
+			end
+			requestMix(cx, sc0)
+			cx:render()
 			return
 		end
 		if act == "playpause" or act == "stop" or act == "home" or act == "back"
@@ -1039,6 +1403,8 @@ local def: BlockDef<State> = {
 			end
 			sc.selT0, sc.selT1 = lo, hi
 			sc.loop = true
+			sc.lastPlaybackBar = nil
+			publishLinkedBar(state, sc, mb)
 			exportSelection(sc)
 			playFrom(state, cx, sc, lo, hi)
 		end

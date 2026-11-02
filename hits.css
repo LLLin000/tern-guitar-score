@@ -60,16 +60,44 @@
 	outline-offset: -1px;
 }
 
+.gmeas.glink {
+	background: rgb(70 150 255 / 13%);
+	outline: 1px solid rgb(70 150 255 / 80%);
+	outline-offset: -1px;
+}
+
 .gscore-bar {
 	position: sticky;
 	top: 0;
 	z-index: 5;
-	display: flex;
-	align-items: center;
-	gap: 0.5ch;
+	display: block;
 	padding: 0.4em 0.2em;
 	background: var(--surface, Canvas);
 	border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+}
+
+.gscore-toolbar,
+.gscore-mixer {
+	min-width: 0;
+	overflow-x: auto;
+	scrollbar-width: thin;
+}
+
+.gscore-mixer {
+	padding-top: 0.25em;
+	border-top: 1px solid var(--border, rgba(128, 128, 128, 0.18));
+}
+
+.gscore-toolbar > .sf-row,
+.gscore-mixer > .sf-row {
+	width: max-content;
+	min-width: 100%;
+	flex-wrap: nowrap;
+}
+
+.gscore-toolbar > .sf-row > *,
+.gscore-mixer > .sf-row > * {
+	flex-shrink: 0;
 }
 
 .ghit { position: absolute; box-sizing: border-box; }
