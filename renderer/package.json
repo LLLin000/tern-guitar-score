@@ -4,7 +4,11 @@
   "description": "alphaTab score renderer + SoundFont audio export for the Tern gscore plugin",
   "main": "index.js",
   "scripts": {
-    "test": "python ../tests/test_audio_backend.py"
+    "test": "python ../tests/test_audio_backend.py",
+    "test:music": "node --test ../tests/test_music_tools.mjs",
+    "test:lesson": "node --test ../tests/test_lesson_tools.mjs",
+    "test:toolkit": "node --test ../tests/test_music_tools.mjs ../tests/test_lesson_tools.mjs && bun ../tests/test_omp_music_tool.ts",
+    "test:omp": "bun ../tests/test_omp_music_tool.ts"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +17,9 @@
   "dependencies": {
     "@coderline/alphaskia": "^3.5.147",
     "@coderline/alphaskia-windows": "^3.5.147",
-    "@coderline/alphatab": "^1.8.4"
+    "@coderline/alphatab": "^1.8.4",
+    "@tombatossals/chords-db": "0.5.1",
+    "svguitar": "2.10.1",
+    "tonal": "6.5.1"
   }
 }

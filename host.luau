@@ -9,6 +9,14 @@ local NODE = "C:/Program Files/nodejs/node.exe"
 local PYTHON = "D:/programs/Python/python.exe"
 local REQUEST = tern.plugin.data .. "/open-request.json"
 
+-- Expose the shared plugin data directory to OMP shell panes.
+tern.on("spawn", function(spec: any)
+	local env = spec.env or {}
+	env.GSCORE_DATA_DIR = tern.plugin.data
+	spec.env = env
+	return spec
+end)
+
 -- native OS file dialog, filtered to score formats
 local function nativePick(callback: (string?) -> ())
 	tern.process.run(
@@ -1704,3 +1712,544 @@ local lib: BlockDef<LibState> = {
 
 tern.block.define("library", lib)
 
+
+-- lesson block ------------------------------------------------------------
+
+type LessonState = {
+	lesson_id: string,
+	revision: number,
+	lesson: any?,
+	err: string?,
+	answers: { [string]: any },
+	selected_pitches: { [string]: any },
+}
+
+local LESSON_ATTEMPT_SENTINEL = "\n__GSCORE_ATTEMPT_END__\n"
+local LESSON_MAX_BYTES = 512 * 1024
+
+local function lessonSafeId(value: any): boolean
+	return type(value) == "string" and #value <= 64 and value:match("^[%w][%w_%-]*$") ~= nil
+end
+
+local function lessonPayloadErrorV1(lesson: any, lessonId: string, revision: number): string?
+	if type(lesson) ~= "table" or lesson.schema ~= "gscore.lesson.v1"
+		or lesson.lesson_id ~= lessonId or lesson.revision ~= revision then
+		return "Lesson metadata does not match the pane request."
+	end
+	if type(lesson.goal) ~= "string" or lesson.goal == ""
+		or type(lesson.activities) ~= "table" or #lesson.activities < 1 or #lesson.activities > 12 then
+		return "Lesson content is invalid."
+	end
+	local seen: { [string]: boolean } = {}
+	for _, activity in ipairs(lesson.activities) do
+		if type(activity) ~= "table" or not lessonSafeId(activity.id) or seen[activity.id] then
+			return "Lesson activity IDs are invalid."
+		end
+		seen[activity.id] = true
+		if activity.type == "explanation" then
+			if type(activity.text) ~= "string" or activity.text == "" then
+				return "Lesson explanation is empty."
+			end
+		elseif activity.type == "chord_diagram" then
+			if type(activity.svg) ~= "string" or #activity.svg > 262144
+				or activity.svg:sub(1, 4) ~= "<svg" or activity.mime ~= "image/svg+xml"
+				or type(activity.width) ~= "number" or activity.width <= 0
+				or type(activity.height) ~= "number" or activity.height <= 0 then
+				return "Lesson chord diagram is invalid."
+			end
+		elseif activity.type == "quiz" then
+			if activity.question_type ~= "slash_bass" or type(activity.prompt) ~= "string"
+				or type(activity.choices) ~= "table" or #activity.choices < 2 or #activity.choices > 6
+				or type(activity.correct_index) ~= "number" or activity.correct_index % 1 ~= 0
+				or activity.correct_index < 1 or activity.correct_index > #activity.choices then
+				return "Lesson quiz is invalid."
+			end
+		else
+			return "Lesson contains an unsupported activity."
+		end
+	end
+	return nil
+end
+
+local function lessonFiniteNumber(value: any): boolean
+	return type(value) == "number" and value == value and value > -math.huge and value < math.huge
+end
+
+local function lessonPayloadErrorV2(lesson: any): string?
+	if type(lesson.goal) ~= "string" or lesson.goal == ""
+		or type(lesson.activities) ~= "table" or #lesson.activities < 1 or #lesson.activities > 12 then
+		return "Lesson v2 content is invalid."
+	end
+	local seen: { [string]: boolean } = {}
+	local visualShapes: { [string]: string } = {}
+	for _, activity in ipairs(lesson.activities) do
+		if type(activity) ~= "table" or not lessonSafeId(activity.id) or seen[activity.id] then
+			return "Lesson v2 activity IDs are invalid."
+		end
+		seen[activity.id] = true
+		if activity.type == "explanation" then
+			if type(activity.content) ~= "string" or activity.content == "" then
+				return "Lesson v2 explanation is empty."
+			end
+		elseif activity.type == "visual" then
+			if activity.renderer ~= "guitar.chord" or activity.intent ~= "compare"
+				or type(activity.items) ~= "table" or #activity.items ~= 2
+				or type(activity.emphasis) ~= "table" or activity.emphasis.property ~= "lowest_sounding_pitch"
+				or type(activity.interaction) ~= "table" or activity.interaction.action ~= "select_pitch" then
+				return "Lesson v2 visual contract is unsupported."
+			end
+			local lowestMidis: { number } = {}
+			for _, item in ipairs(activity.items) do
+				local ref = if type(item) == "table" then item.shape_ref else nil
+				local shape = if type(item) == "table" then item.shape else nil
+				local diagram = if type(item) == "table" then item.diagram else nil
+				if type(ref) ~= "table" or type(ref.symbol) ~= "string" or #ref.symbol == 0 or #ref.symbol > 80
+					or type(ref.id) ~= "string" or #ref.id ~= 71 or not ref.id:match("^gshape_[0-9a-f]+$")
+					or type(shape) ~= "table" or shape.shape_id ~= ref.id or item.symbol ~= ref.symbol
+					or type(shape.actualFrets) ~= "table" or #shape.actualFrets ~= 6 or type(shape.notes) ~= "table"
+					or type(shape.midi) ~= "table" or #shape.notes ~= #shape.midi
+					or not lessonFiniteNumber(shape.lowestMidi)
+					or type(shape.lowestNote) ~= "string"
+					or type(diagram) ~= "table" or type(diagram.svg) ~= "string"
+					or #diagram.svg > 262144 or diagram.svg:sub(1, 4) ~= "<svg"
+					or diagram.mime ~= "image/svg+xml"
+					or not lessonFiniteNumber(diagram.width) or diagram.width <= 0
+					or not lessonFiniteNumber(diagram.height) or diagram.height <= 0
+					or type(diagram.hit_regions) ~= "table" then
+					return "Lesson v2 guitar shape or diagram is invalid."
+				end
+				local notesByString: { [number]: any } = {}
+				local noteIndex = 0
+				local actualLowestMidi = math.huge
+				local actualLowestNote: string? = nil
+				for index, fret in ipairs(shape.actualFrets) do
+					if not lessonFiniteNumber(fret) or fret % 1 ~= 0 then
+						return "Lesson v2 guitar frets are invalid."
+					end
+					if fret >= 0 then
+						noteIndex = noteIndex + 1
+						local midi = shape.midi[noteIndex]
+						local pitch = shape.notes[noteIndex]
+						if not lessonFiniteNumber(midi) or type(pitch) ~= "string" then
+							return "Lesson v2 guitar pitches are invalid."
+						end
+						notesByString[7 - index] = { fret = fret, midi = midi, pitch = pitch }
+						if midi < actualLowestMidi then
+							actualLowestMidi = midi
+							actualLowestNote = pitch
+						end
+					end
+				end
+				if noteIndex == 0 or noteIndex ~= #shape.notes or actualLowestMidi ~= shape.lowestMidi
+					or actualLowestNote ~= shape.lowestNote or #diagram.hit_regions ~= noteIndex then
+					return "Lesson v2 guitar shape pitches or hit regions do not match."
+				end
+				local regionIds: { [string]: boolean } = {}
+				for _, region in ipairs(diagram.hit_regions) do
+					if type(region) ~= "table" or not lessonFiniteNumber(region.string)
+						or region.string % 1 ~= 0 or region.string < 1 or region.string > 6
+						or not lessonFiniteNumber(region.fret) or region.fret % 1 ~= 0
+						or type(region.id) ~= "string" then
+						return "Lesson v2 hit region is invalid."
+					end
+					local expected = notesByString[region.string]
+					local regionId = "s" .. tostring(region.string) .. "f" .. tostring(region.fret)
+					if expected == nil or regionIds[regionId] or region.id ~= regionId
+						or region.fret ~= expected.fret or region.midi ~= expected.midi
+						or region.pitch ~= expected.pitch or region.lowest ~= (expected.midi == shape.lowestMidi)
+						or not lessonFiniteNumber(region.x) or not lessonFiniteNumber(region.y)
+						or not lessonFiniteNumber(region.w) or not lessonFiniteNumber(region.h)
+						or region.x < 0 or region.y < 0 or region.w <= 0 or region.h <= 0
+						or region.x + region.w > 1 or region.y + region.h > 1 then
+						return "Lesson v2 hit region does not match the guitar shape."
+					end
+					regionIds[regionId] = true
+				end
+				visualShapes[ref.id] = ref.symbol
+				table.insert(lowestMidis, shape.lowestMidi)
+			end
+			if lowestMidis[1] == lowestMidis[2] then
+				return "Lesson v2 comparison has no lowest-pitch contrast."
+			end
+		elseif activity.type == "quiz" then
+			local source = if type(activity.answer_source) == "table" then activity.answer_source.derived_from else nil
+			if type(activity.question) ~= "string" or activity.question == ""
+				or type(activity.options) ~= "table" or #activity.options < 2 or #activity.options > 6
+				or not lessonFiniteNumber(activity.correct_index) or activity.correct_index % 1 ~= 0
+				or activity.correct_index < 1 or activity.correct_index > #activity.options
+				or activity.correct_choice ~= activity.options[activity.correct_index]
+				or type(source) ~= "table" or activity.answer_source.property ~= "lowest_sounding_pitch_class"
+				or visualShapes[source.id] ~= source.symbol then
+				return "Lesson v2 quiz is invalid."
+			end
+		else
+			return "Lesson v2 contains an unsupported activity."
+		end
+	end
+	return nil
+end
+
+local function lessonPayloadError(lesson: any, lessonId: string, revision: number): string?
+	if type(lesson) ~= "table" or lesson.lesson_id ~= lessonId or lesson.revision ~= revision then
+		return "Lesson metadata does not match the pane request."
+	end
+	if lesson.schema == "gscore.lesson.v1" then
+		return lessonPayloadErrorV1(lesson, lessonId, revision)
+	elseif lesson.schema == "gscore.lesson.v2" then
+		return lessonPayloadErrorV2(lesson)
+	end
+	return "Lesson schema is unsupported."
+end
+
+local function lessonQuizChoices(schema: string, activity: any): any
+	if schema == "gscore.lesson.v1" then
+		return activity.choices
+	elseif schema == "gscore.lesson.v2" then
+		return activity.options
+	end
+	return nil
+end
+
+local function readLessonAttempts(lessonId: string, revision: number, lesson: any): { [string]: any }
+	local quizzes: { [string]: any } = {}
+	for _, activity in ipairs(lesson.activities) do
+		if activity.type == "quiz" then
+			quizzes[activity.id] = activity
+		end
+	end
+	local answers: { [string]: any } = {}
+	local dir = tern.plugin.data .. "/lesson_attempts/" .. lessonId
+	local okList, names = pcall(tern.fs.list, dir)
+	if not okList or type(names) ~= "table" then
+		return answers
+	end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		if name:match("^attempt_[%w_%-]+%.json$") then
+			local okRead, raw = pcall(tern.fs.read, dir .. "/" .. name)
+			if okRead and type(raw) == "string" and raw:sub(-#LESSON_ATTEMPT_SENTINEL) == LESSON_ATTEMPT_SENTINEL then
+				local body = raw:sub(1, #raw - #LESSON_ATTEMPT_SENTINEL)
+				local okDecode, attempt = pcall(tern.json.decode, body)
+				local activity = if okDecode and type(attempt) == "table" then quizzes[attempt.activity_id] else nil
+				local choices = if activity ~= nil then lessonQuizChoices(lesson.schema, activity) else nil
+				if activity ~= nil and type(choices) == "table" and attempt.schema == "gscore.lesson.attempt.v1"
+					and attempt.lesson_id == lessonId and attempt.revision == revision
+					and type(attempt.selected_index) == "number" and attempt.selected_index % 1 == 0
+					and attempt.selected_index >= 1 and attempt.selected_index <= #choices
+					and attempt.selected_choice == choices[attempt.selected_index]
+					and type(attempt.attempted_at_ms) == "number"
+					and (attempt.sequence == nil or (type(attempt.sequence) == "number" and attempt.sequence % 1 == 0 and attempt.sequence >= 0)) then
+					local previous = answers[activity.id]
+					local sequence = if type(attempt.sequence) == "number" then attempt.sequence else 0
+					if previous == nil or attempt.attempted_at_ms > previous.attempted_at_ms
+						or (attempt.attempted_at_ms == previous.attempted_at_ms and sequence >= (tonumber(previous.sequence) or 0)) then
+						answers[activity.id] = {
+							selected_index = attempt.selected_index,
+							selected_choice = attempt.selected_choice,
+							correct = attempt.correct,
+							attempted_at_ms = attempt.attempted_at_ms,
+							sequence = sequence,
+						}
+					end
+				end
+			end
+		end
+	end
+	return answers
+end
+
+local function mergeSavedLessonAnswers(answers: { [string]: any }, saved: any, lesson: any)
+	if type(saved) ~= "table" or type(saved.answers) ~= "table" then
+		return
+	end
+	local quizzes: { [string]: any } = {}
+	for _, activity in ipairs(lesson.activities) do
+		if activity.type == "quiz" then
+			quizzes[activity.id] = activity
+		end
+	end
+	for id, answer in pairs(saved.answers) do
+		local activity = quizzes[id]
+		local choices = if activity ~= nil then lessonQuizChoices(lesson.schema, activity) else nil
+		if activity ~= nil and type(answer) == "table" and type(choices) == "table"
+			and type(answer.selected_index) == "number" and answer.selected_index % 1 == 0
+			and answer.selected_index >= 1 and answer.selected_index <= #choices
+			and answer.selected_choice == choices[answer.selected_index]
+			and answer.correct == (answer.selected_index == activity.correct_index)
+			and type(answer.attempted_at_ms) == "number"
+			and (answer.sequence == nil or (type(answer.sequence) == "number" and answer.sequence % 1 == 0 and answer.sequence >= 0)) then
+			local previous = answers[id]
+			local sequence = if type(answer.sequence) == "number" then answer.sequence else 0
+			if previous == nil or answer.attempted_at_ms > previous.attempted_at_ms
+				or (answer.attempted_at_ms == previous.attempted_at_ms and sequence >= (tonumber(previous.sequence) or 0)) then
+				answers[id] = {
+					selected_index = answer.selected_index,
+					selected_choice = answer.selected_choice,
+					correct = answer.correct,
+					attempted_at_ms = answer.attempted_at_ms,
+					sequence = sequence,
+				}
+			end
+		end
+	end
+end
+
+local lesson: BlockDef<LessonState> = {
+	init = function(cx: any, args: { string }, saved: any): LessonState
+		local lessonId = args[1] or (if type(saved) == "table" then saved.lesson_id else nil) or ""
+		local revision = tonumber(args[2]) or (if type(saved) == "table" then tonumber(saved.revision) else nil) or 0
+		local state: LessonState = {
+			lesson_id = lessonId,
+			revision = revision,
+			lesson = nil,
+			err = nil,
+			answers = {},
+			selected_pitches = {},
+		}
+		if not lessonSafeId(lessonId) or revision < 1 or revision % 1 ~= 0 then
+			state.err = "Lesson ID or revision is invalid."
+			return state
+		end
+		local file = string.format("%s/lessons/%s/r%d.json", tern.plugin.data, lessonId, revision)
+		local okRead, raw = pcall(tern.fs.read, file)
+		if not okRead or type(raw) ~= "string" or #raw > LESSON_MAX_BYTES then
+			state.err = "Lesson file is missing, unreadable, or too large."
+			return state
+		end
+		local okDecode, decoded = pcall(tern.json.decode, raw)
+		if not okDecode then
+			state.err = "Lesson JSON is invalid."
+			return state
+		end
+		local payloadError = lessonPayloadError(decoded, lessonId, revision)
+		if payloadError ~= nil then
+			state.err = payloadError
+			return state
+		end
+		state.lesson = decoded
+		state.answers = readLessonAttempts(lessonId, revision, decoded)
+		if type(saved) == "table" and saved.lesson_id == lessonId and tonumber(saved.revision) == revision then
+			mergeSavedLessonAnswers(state.answers, saved, decoded)
+		end
+		return state
+	end,
+
+	view = function(state: LessonState, cx: any): BlockView
+		if state.err ~= nil or state.lesson == nil then
+			return { main = ui.col({
+				ui.text({ ui.span("Lesson unavailable", "error") }),
+				ui.text({ ui.span(state.err or "Lesson data is unavailable.", "muted") }),
+			}) }
+		end
+		local rows: { Node } = {
+			ui.text({ ui.span(state.lesson.goal, "accent") }),
+		}
+		for _, activity in ipairs(state.lesson.activities) do
+			local card: { Node } = {}
+			if state.lesson.schema == "gscore.lesson.v2" then
+				if activity.type == "explanation" then
+					table.insert(card, ui.text({ ui.span("Explanation", "accent") }))
+					table.insert(card, ui.text({ ui.span(activity.content) }))
+				elseif activity.type == "visual" then
+					table.insert(card, ui.text({ ui.span("Compare the lowest sounding pitch", "accent") }))
+					local diagrams: { Node } = {}
+					for itemIndex, item in ipairs(activity.items) do
+						local diagramCard: { Node } = {
+							ui.text({ ui.span(item.symbol .. " · lowest " .. item.shape.lowestNote, "accent") }),
+						}
+						if item.diagram.blob == nil then
+							local okBlob, blob = pcall(function()
+								return cx:blob(item.diagram.svg, item.diagram.mime)
+							end)
+							if okBlob then
+								item.diagram.blob = blob
+							end
+						end
+						if item.diagram.blob ~= nil then
+							local hits: { Node } = {}
+							for _, region in ipairs(item.diagram.hit_regions) do
+								local selection = state.selected_pitches[activity.id]
+								local selected = selection ~= nil and selection.item_index == itemIndex
+									and selection.hit_id == region.id
+								local class = "glesson-hit " .. box(region)
+								if region.lowest then
+									class = class .. " glowest"
+								end
+								if selected then
+									class = class .. " gselected"
+								end
+								local hit = ui.el("button", {
+									class = class,
+									title = region.pitch .. " · string " .. tostring(region.string)
+										.. " · fret " .. tostring(region.fret),
+								})
+								local hitProps: { [string]: any } = hit.p or {}
+								hitProps.actions = {
+									click = "pitch=" .. activity.id .. ":" .. tostring(itemIndex) .. ":" .. region.id,
+								}
+								hit.p = hitProps
+								table.insert(hits, hit)
+							end
+							table.insert(diagramCard, ui.node("image", {
+								blob = item.diagram.blob, w = item.diagram.width, h = item.diagram.height,
+								alt = item.diagram.alt,
+							}, hits))
+						else
+							table.insert(diagramCard, ui.text({ ui.span("Guitar diagram could not be rendered.", "error") }))
+						end
+						table.insert(diagrams, ui.el("div", { class = "glesson-diagram" }, { ui.col(diagramCard) }))
+					end
+					table.insert(card, ui.el("div", { class = "glesson-diagrams" }, { ui.row(diagrams) }))
+				elseif activity.type == "quiz" then
+					table.insert(card, ui.text({ ui.span(activity.question, "accent") }))
+					local answer = state.answers[activity.id]
+					for index, choice in ipairs(activity.options) do
+						local tone = if answer == nil then "muted"
+							elseif index == answer.selected_index then (if answer.correct then "accent" else "error")
+							else "muted"
+						table.insert(card, badgeButton(tostring(choice),
+							"answer=" .. activity.id .. ":" .. tostring(index),
+							"Select " .. tostring(choice), tone))
+					end
+					if answer ~= nil then
+						local correctChoice = tostring(activity.correct_choice)
+						local feedback = if answer.correct
+							then "Correct — " .. correctChoice .. " is the lowest sounding pitch."
+							else "Not quite. The lowest sounding pitch is " .. correctChoice .. "."
+						table.insert(card, ui.text({ ui.span(feedback, if answer.correct then "accent" else "error") }))
+					end
+				end
+			elseif state.lesson.schema == "gscore.lesson.v1" then
+				if activity.type == "explanation" then
+					table.insert(card, ui.text({ ui.span(activity.title or "Explanation", "accent") }))
+					table.insert(card, ui.text({ ui.span(activity.text) }))
+				elseif activity.type == "chord_diagram" then
+					table.insert(card, ui.text({ ui.span(activity.symbol .. " · bass " .. tostring(activity.bass), "accent") }))
+					if activity.blob == nil then
+						local okBlob, blob = pcall(function()
+							return cx:blob(activity.svg, activity.mime)
+						end)
+						if okBlob then
+							activity.blob = blob
+						end
+					end
+					if activity.blob ~= nil then
+						table.insert(card, ui.node("image", {
+							blob = activity.blob, w = activity.width, h = activity.height, alt = activity.alt,
+						}))
+					else
+						table.insert(card, ui.text({ ui.span("Chord diagram could not be rendered.", "error") }))
+					end
+				elseif activity.type == "quiz" then
+					table.insert(card, ui.text({ ui.span(activity.prompt, "accent") }))
+					local answer = state.answers[activity.id]
+					for index, choice in ipairs(activity.choices) do
+						local tone = if answer == nil then "muted"
+							elseif index == answer.selected_index then (if answer.correct then "accent" else "error")
+							else "muted"
+						table.insert(card, badgeButton(tostring(choice),
+							"answer=" .. activity.id .. ":" .. tostring(index),
+							"Select " .. tostring(choice), tone))
+					end
+					if answer ~= nil then
+						local correctChoice = tostring(activity.choices[activity.correct_index])
+						local feedback = if answer.correct
+							then "Correct — " .. correctChoice .. " is the slash bass."
+							else "Not quite. The slash bass is " .. correctChoice .. "."
+						table.insert(card, ui.text({ ui.span(feedback, if answer.correct then "accent" else "error") }))
+					end
+				end
+			end
+			table.insert(rows, ui.el("div", { class = "gscore-lesson-activity" }, { ui.col(card) }))
+		end
+		return { main = ui.col(rows) }
+	end,
+
+	event = function(state: LessonState, ev: any, cx: any)
+		if ev.ev ~= "action" or state.lesson == nil then
+			return
+		end
+		if ev.act == "pitch" and state.lesson.schema == "gscore.lesson.v2" then
+			local activityId, itemText, hitId = tostring(ev.value or ""):match("^([%w_%-]+):(%d+):([%w_%-]+)$")
+			local itemIndex = tonumber(itemText)
+			if activityId == nil or itemIndex == nil or itemIndex % 1 ~= 0 then
+				return
+			end
+			for _, activity in ipairs(state.lesson.activities) do
+				local item = if activity.type == "visual" then activity.items[itemIndex] else nil
+				if activity.id == activityId and type(item) == "table" then
+					for _, region in ipairs(item.diagram.hit_regions) do
+						if region.id == hitId then
+							state.selected_pitches[activityId] = { item_index = itemIndex, hit_id = hitId }
+							cx:render()
+							return
+						end
+					end
+				end
+			end
+			return
+		elseif ev.act ~= "answer" then
+			return
+		end
+		local activityId, choiceText = tostring(ev.value or ""):match("^([%w_%-]+):(%d+)$")
+		local selectedIndex = tonumber(choiceText)
+		if activityId == nil or selectedIndex == nil then
+			return
+		end
+		for _, activity in ipairs(state.lesson.activities) do
+			local choices = if activity.type == "quiz" then lessonQuizChoices(state.lesson.schema, activity) else nil
+			if activity.id == activityId and activity.type == "quiz" and type(choices) == "table"
+				and selectedIndex >= 1 and selectedIndex <= #choices then
+				local attemptedAt = os.time() * 1000
+				local sequence = 0
+				local sequenceReadOk, storedSequence = pcall(tern.kv.get, "lessonAttemptSequence")
+				if sequenceReadOk then
+					local nextSequence = math.max(0, math.floor(tonumber(storedSequence) or 0)) + 1
+					local sequenceWriteOk, sequenceWriteResult = pcall(tern.kv.set, "lessonAttemptSequence", nextSequence)
+					if sequenceWriteOk and sequenceWriteResult ~= false then
+						sequence = nextSequence
+					end
+				end
+				local correct = selectedIndex == activity.correct_index
+				local answer = {
+					selected_index = selectedIndex,
+					selected_choice = choices[selectedIndex],
+					correct = correct,
+					attempted_at_ms = attemptedAt,
+					sequence = sequence,
+				}
+				state.answers[activityId] = answer
+				local paneId = tostring(cx.pane):gsub("[^%w_]", "_")
+				local attemptId = string.format("%s_%d_%d", paneId, attemptedAt, math.random(1000000))
+				local directory = tern.plugin.data .. "/lesson_attempts/" .. state.lesson_id
+				pcall(tern.fs.mkdir, directory)
+				local attempt = {
+					schema = "gscore.lesson.attempt.v1",
+					attempt_id = attemptId,
+					lesson_id = state.lesson_id,
+					revision = state.revision,
+					activity_id = activityId,
+					selected_index = selectedIndex,
+					selected_choice = answer.selected_choice,
+					correct = correct,
+					attempted_at_ms = attemptedAt,
+					sequence = sequence,
+				}
+				local file = directory .. "/attempt_" .. attemptId .. ".json"
+				local okWrite, writeResult = pcall(tern.fs.write, file,
+					tern.json.encode(attempt) .. LESSON_ATTEMPT_SENTINEL)
+				if not okWrite or writeResult == false then
+					cx:toast("error", "Answer not saved", "The feedback is visible, but Agent history could not be written.")
+				end
+				cx:render()
+				return
+			end
+		end
+	end,
+
+	save = function(state: LessonState): any
+		return { lesson_id = state.lesson_id, revision = state.revision, answers = state.answers }
+	end,
+}
+
+tern.block.define("lesson", lesson)

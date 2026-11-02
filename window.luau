@@ -10,6 +10,7 @@ local PYTHON_EXE = "D:/programs/Python/python.exe"
 local REQUEST = tern.plugin.data .. "/open-request.json"
 local DRAFT_REQUESTS = tern.plugin.data .. "/draft_requests"
 local REQUEST_END_SENTINEL = "\n__GSCORE_END__\n"
+local LESSON_REQUESTS = tern.plugin.data .. "/lesson_requests"
 local POLL_MS = 400
 
 
@@ -197,6 +198,86 @@ local function runDraftRequest(cx: any)
 	end
 end
 
+-- Open complete Lesson requests beside their target pane; legacy callers fall back to focus.
+local function processLessonRequest(cx: any, file: string, name: string)
+	local okRead, raw = pcall(tern.fs.read, file)
+	if not okRead or type(raw) ~= "string" then
+		return
+	end
+	local okDecode, request = pcall(tern.json.decode, raw)
+	if not okDecode or type(request) ~= "table"
+		or request.schema ~= "gscore.lesson.open.v1"
+		or type(request.lesson_id) ~= "string"
+		or request.lesson_id:match("^[%w][%w_%-]*$") == nil
+		or type(request.revision) ~= "number" or request.revision < 1 or request.revision % 1 ~= 0
+		or type(request.request_id) ~= "string"
+		or (request.target_pane ~= nil and (type(request.target_pane) ~= "string"
+			or #request.target_pane > 64 or request.target_pane:match("^[%w][%w_%-]*$") == nil))
+		or name ~= "req_" .. request.request_id .. ".json" then
+		pcall(tern.fs.remove, file)
+		cx:toast("error", "Bad Lesson request", name)
+		return
+	end
+	local lessonFile = string.format("%s/lessons/%s/r%d.json", tern.plugin.data,
+		request.lesson_id, request.revision)
+	if not tern.fs.exists(lessonFile) then
+		pcall(tern.fs.remove, file)
+		cx:toast("error", "Lesson file missing", request.lesson_id)
+		return
+	end
+	local anchor = nil
+	if request.target_pane ~= nil then
+		for _, info in cx.session:panes() do
+			if tostring(info.pane) == request.target_pane then
+				anchor = info.pane
+				break
+			end
+		end
+		-- Other Tern windows share plugin data but must leave this request queued.
+		if anchor == nil then
+			return
+		end
+	else
+		anchor = cx.session:focused()
+	end
+	if anchor == nil then
+		return
+	end
+	local count = 0
+	for _ in cx.session:panes() do
+		count = count + 1
+	end
+	if count > 16 then
+		pcall(tern.fs.remove, file)
+		cx:toast("warning", "Too many panes open", "Close a pane, then publish the Lesson again")
+		return
+	end
+	local pane = cx.layout:split(anchor, "right", {
+		block = "gscore.lesson",
+		args = { request.lesson_id, tostring(request.revision) },
+	})
+	if not pane then
+		pcall(tern.fs.remove, file)
+		cx:toast("error", "Could not open Lesson pane", request.lesson_id)
+		return
+	end
+	pcall(tern.fs.remove, file)
+	cx:toast("success", "Lesson ready", request.lesson_id)
+end
+
+local function runLessonRequests(cx: any)
+	local ok, names = pcall(tern.fs.list, LESSON_REQUESTS)
+	if not ok or type(names) ~= "table" then
+		return
+	end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		if name:match("^req_[%da-fA-F%-]+%.json$") then
+			processLessonRequest(cx, LESSON_REQUESTS .. "/" .. name, name)
+		end
+	end
+end
+
 
 local function consume(cx: any)
 	local ok, text = pcall(tern.fs.read, REQUEST)
@@ -263,6 +344,7 @@ local function poll(cx: any)
 	if cx ~= nil then
 		pcall(consume, cx)
 		pcall(runDraftRequest, cx)
+		pcall(runLessonRequests, cx)
 	end
 	tern.timer(POLL_MS, poll)
 end

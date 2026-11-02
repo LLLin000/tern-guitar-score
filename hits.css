@@ -101,6 +101,55 @@
 }
 
 .ghit { position: absolute; box-sizing: border-box; }
+
+.glesson-diagrams {
+	max-width: 100%;
+	overflow-x: auto;
+	scrollbar-width: thin;
+}
+.glesson-diagrams > .sf-row {
+	align-items: flex-start;
+	flex-wrap: nowrap;
+	gap: 1em;
+	width: max-content;
+	min-width: 100%;
+}
+.glesson-diagram {
+	flex: 0 0 400px;
+	width: 400px;
+}
+.glesson-diagram .sf-image {
+	align-self: flex-start;
+	width: 400px;
+	max-width: none;
+	height: auto;
+	object-fit: contain;
+}
+.glesson-hit {
+	position: absolute;
+	box-sizing: border-box;
+	padding: 0;
+	border: 1px solid transparent;
+	border-radius: 50%;
+	background: transparent;
+	cursor: pointer;
+}
+.glesson-hit.glowest {
+	border-color: var(--accent, #5a96ff);
+	background: var(--accent, #5a96ff);
+	opacity: 0.22;
+}
+.glesson-hit.gselected,
+.glesson-hit:hover {
+	border-color: var(--accent, #5a96ff);
+	background: var(--accent, #5a96ff);
+	opacity: 0.5;
+}
+.glesson-hit:focus-visible {
+	outline: 2px solid var(--accent, #5a96ff);
+	outline-offset: 2px;
+	opacity: 0.7;
+}
 .gbar {
 	position: absolute;
 	pointer-events: none;

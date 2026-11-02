@@ -15,3 +15,7 @@ files = ["*.musicxml", "*.xml", "*.mxl", "*.gp", "*.gp3", "*.gp4", "*.gp5", "*.g
 [[blocks]]
 id = "library"
 title = "Score Library"
+
+[[blocks]]
+id = "lesson"
+title = "Guitar Lesson"

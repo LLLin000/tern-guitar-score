@@ -14,10 +14,11 @@ built on alphaTab (layout + SoundFont synthesis) and a resident mpv audio engine
 - **Compare and follow.** Keep the source and multiple drafts open side by side; linked measures stay aligned, playback reveals the current system, and resizing reflows notation without regenerating audio.
 - **Mix.** Mute or solo separable MIDI tracks; the live metronome follows the current track mix.
 - **Agent context.** `selection.json` (`music_context_v1`) exports stable note ids, string/fret, absolute MIDI, durations, tuplets, ties, hammer-ons, slides, tuning, and time signature.
+- **Dynamic lessons (P4-B).** Explicit `gscore.lesson.v1` compatibility plus a strict v2 chord-comparison slice: calculator-resolved C/C/E shapes, lowest-note diagrams with clickable pitch hitboxes, fact-derived quiz answers, and immutable revision-scoped attempts.
 
 ## Architecture
 
-Four layers, each owning one concern:
+Four layers own the score/playback path:
 
 ```
 Tern Native UI (Luau)        score panes, hit boxes, toolbar, viewport links
@@ -31,15 +32,21 @@ Audio Engine (mpv + IPC)     playback, seek, speed, loop, transport-preserving m
 
 Luau never synthesises audio and never keeps its own playback clock.
 
+Teaching path: OMP Agent → `gscore_music_query` → Lesson validator/publisher → versioned `gscore.lesson` pane → persisted quiz attempts → OMP Agent.
+
 ## Files
 
 | File | Role |
 | --- | --- |
-| `plugin.toml` | Manifest: blocks `score` and `library`, file associations |
-| `host.luau` | Blocks: rendering orchestration, hit boxes, transport, selection export |
-| `window.luau` | Window commands, split layout, agent request poller |
-| `hits.css` | Coordinate classes (`.gx`/`.gy`/`.gw`/`.gh`), cursor, toolbar, library |
-| `renderer/index.mjs` | alphaTab → PNG systems + note/beat bounds + `full.wav` + `count_in.wav` + `track-N.wav` stems + `metronome.wav` + `tracks.json` |
+| `plugin.toml` | Manifest: `score`, `library`, and `lesson` blocks |
+| `host.luau` | Score, library, and Lesson blocks; rendering, transport, quiz feedback, attempt persistence |
+| `window.luau` | Window commands, split layout, draft and Lesson request pollers |
+| `hits.css` | Score hit-box coordinates, cursor, toolbar, library |
+| `renderer/index.mjs` | alphaTab → PNG systems, note/beat bounds, WAV and track stems |
+| `renderer/music_tools.mjs` | Tonal calculations, curated guitar shapes, validated SVG diagrams |
+| `renderer/lesson_tools.mjs` | Lesson schema/music validation, revisioned publication, quiz-attempt reader |
+| `.omp/tools/` | OMP tools for music queries, Lesson publication, and attempt reads |
+| `.omp/skills/guitar-tutor/SKILL.md` | Teaching workflow and current Lesson limits |
 | `audio_backend.py` | Resident mpv process + JSON IPC over a Windows named pipe |
 | `pickfile.py` | Native Windows file dialog, filtered to score formats |
 
@@ -94,6 +101,8 @@ python tools/generate_draft.py --template slow_drill --bpm 50 --open
 
 Drop a request file in the plugin data directory; the window half polls it every 400 ms.
 
+The P4-B teaching path is context-free: the Agent uses explicit chord/theory prompts. It does not yet import the current score selection or launch an Agent from a score pane. The OMP tools are project-scoped (run OMP with this repository as its working directory); `GSCORE_DATA_DIR` is injected into Tern shell panes. This file bridge is same-host only.
+
 ```jsonc
 // <plugin data>/open-request.json
 {"file": "D:/scores/study.gp5"}     // open one score beside the focused pane
@@ -121,6 +130,85 @@ Selecting bars in a score writes `<plugin data>/selection.json`:
 }
 ```
 
+
+## Open-source music tools
+
+`renderer/music_tools.mjs` exposes the same deterministic calculations used by the OMP adapter. It uses Tonal for chord/key/detection calculations, `@tombatossals/chords-db` for curated standard-tuning shapes, and SVGuitar for sanitized diagrams.
+
+```json
+{"op":"chord.describe","symbol":"C/E"}
+```
+
+```json
+{"schema":"gscore.music.v1","ok":true,"op":"chord.describe","result":{"symbol":"C/E","name":"C major over E","chordRoot":"C","bass":"E","quality":"major","pitchClasses":["C","E","G"],"rootIntervals":["1P","3M","5P"],"inversion":1,"voicing":null}}
+```
+
+Operations: `chord.describe`, `key.describe` (major; natural, harmonic, and melodic minor), `chord.detect` (candidate evidence and ambiguity), `guitar.shapes`, and `guitar.diagram`. A chord symbol describes chord tones and slash bass, not an actual guitar voicing; `voicing` is `null` unless a shape is explicitly returned. The shape database is curated data, not a general fingering solver.
+
+## Agent-driven lessons (P4-B)
+
+OMP exposes three tools: `gscore_music_query`, `gscore_publish_lesson`, and `gscore_read_lesson_attempts`. The `guitar-tutor` skill tells the model to calculate facts first, compose a short Lesson, and use recorded answers as evidence rather than claiming mastery.
+
+The first `gscore.lesson.v1` supports three activity types: `explanation`, `chord_diagram`, and `quiz` with `question_type: "slash_bass"`. The publisher generates SVG from the curated shape database, derives the question prompt and answer index, rejects an inconsistent answer key or ambiguous note choices, writes an immutable revision, and queues a unique pane-open request. The Host renders the diagram via `cx:blob`, records each quiz answer, and displays deterministic feedback. No model-authored SVG, HTML, or file path is accepted.
+
+Example tool input:
+
+```json
+{
+  "lesson": {
+    "goal": "Understand why C/E is a C major inversion",
+    "activities": [
+      {"id":"explain","type":"explanation","title":"Root and bass","text":"C/E keeps C major's chord tones but puts E in the bass."},
+      {"id":"diagram","type":"chord_diagram","symbol":"C/E"},
+      {"id":"quiz","type":"quiz","question_type":"slash_bass","symbol":"C/E","choices":["C","E","G"],"correct_answer":"E"}
+    ]
+  }
+}
+```
+
+![Legacy v1 C/E inversion lesson rendered in a Tern pane](assets/gscore-lesson.png)
+
+Publication writes `lessons/<lesson_id>/r<revision>.json` and `lesson_requests/req_<uuid>.json` under plugin data. Lesson/request files use temp-file + rename publication. When `TERN_PANE` is available, the request targets that pane; other Tern windows leave it queued, and the matching window splits beside the target. External callers without pane context retain focused-pane fallback. Quiz attempts use unique files, a completeness sentinel, wall-clock time, and a persisted sequence counter for ordering across reloads; attempt writes are not filesystem-atomic. OMP reads complete attempts through `gscore_read_lesson_attempts`.
+
+The earlier v1 live acceptance exercised one real OMP model path in Tern: calculator calls → C/E Lesson publication → pane opened → E answer clicked → feedback shown → OMP read the persisted correct attempt. Other providers, arbitrary project directories, remote hosts, score-selection context, and custom tuning were not covered.
+
+For the next-step design, see [Lesson architecture](docs/research/gscore-lesson-architecture.md) and the [prior-art comparison of generative UI DSLs](docs/research/generative-ui-dsl-prior-art.md).
+
+### `gscore.lesson.v2`: chord-comparison slice
+
+V1 keeps its explicit legacy read/write route during migration. V2 is selected only by `schema: "gscore.lesson.v2"`; the publisher assigns each revision and stores it without replacing earlier revisions.
+
+The v2 publisher accepts only `explanation`, `visual`, and `quiz` activities. A visual is currently limited to comparing two calculator-returned `guitar.chord` shapes, emphasizing the actual lowest sounding pitch, and allowing pitch selection. The publisher resolves each `{symbol, id}` reference again, verifies the actual sounding notes and renderer hitboxes, and derives the quiz answer from the displayed shape. Agent-supplied SVG, answer indices, and revisions are rejected.
+
+```json
+{
+  "schema": "gscore.lesson.v2",
+  "lesson_id": "c-e-lesson",
+  "goal": "Understand the difference between C and C/E",
+  "activities": [
+    {"id":"explain","type":"explanation","content":"C/E keeps C as the chord root and places E in the bass."},
+    {
+      "id":"compare","type":"visual","renderer":"guitar.chord","intent":"compare",
+      "items":[
+        {"shape_ref":{"symbol":"C","id":"<shape_id returned by gscore_music_query>"}},
+        {"shape_ref":{"symbol":"C/E","id":"<shape_id returned by gscore_music_query>"}}
+      ],
+      "emphasis":{"property":"lowest_sounding_pitch"},
+      "interaction":{"action":"select_pitch"}
+    },
+    {
+      "id":"quiz","type":"quiz","question":"Which pitch class is lowest in the displayed C/E shape?",
+      "options":["C","E","G"],
+      "answer":{"derived_from":{"symbol":"C/E","id":"<same C/E shape_id>"},"property":"lowest_sounding_pitch_class"}
+    }
+  ]
+}
+```
+
+`gscore_read_lesson_attempts` accepts an exact `revision` filter and deduplicates by `attempt_id`; omitting `revision` retains the legacy all-revisions read. Clicked pitch selections update the Tern view locally; quiz answers are the persisted Agent-readable feedback.
+
+The v2 C/C/E loop used one real OMP model: it published revision 1 from queried shapes; a wrong C answer was clicked in Tern; OMP read that exact revision-1 attempt, diagnosed root/bass confusion, and published revision 2 with a materially different explanation. Revision 1 remained intact. The untargeted external open initially landed in another Tern session; `TERN_PANE` targeting was added to the existing file queue, and a real OMP targeted-publication smoke opened beside its source pane. Revision 2 was then rendered beside revision 1 in Tern; no second answer was submitted, so this is adaptive-content evidence, not mastery evidence.
+
 ## Running
 
 ```bash
@@ -138,23 +226,21 @@ atomically to `audio_state.json` every 30 ms.
 
 ## Tests
 
-All four suites use the repo-local fixture (the renderer stem test derives a two-track score from it),
-so they need no private paths.
+The Python integration suites cover rendering, generation, and audio; Node tests cover music and Lesson behavior, and a Bun check covers OMP request normalization.
 
 ```bash
-python tests/test_renderer_audio.py     # separate track stems, click stem, resize-safe audio output
-python tests/test_audio_backend.py      # count-in loop reset, live mix, speed ratio, pause watchdog
-python tests/test_concurrency.py        # sentinel recovery, repeated/corrupt commands, A-B bounds,
-                                        # pause/resume, zero orphan mpv
-python tests/test_interactive_workflow.py # P2 selection -> generation -> render -> playback
+python tests/test_renderer_audio.py
+python tests/test_audio_backend.py
+python tests/test_concurrency.py
+python tests/test_interactive_workflow.py
+npm --prefix renderer run test:toolkit
 ```
 
 
 ## Known limits
 
-- Automated suites cover rendering, generation, and audio, but not Tern's native UI. P3 `reveal`,
-  resize, toolbar, and source/draft links have been manually checked in a live host; they remain
-  manual acceptance rather than CI coverage.
-- Count-in length uses the first bar's numerator and initial tempo; compound metres and tempo changes
-  in the count-in bar need separate validation.
-- Mute/Solo is unavailable when MIDI channels overlap between tracks.
+- P3 follow/reveal, responsive layout, mixing, and source/draft-link behavior still need their own full live acceptance; the Lesson smoke test does not verify them.
+- P4-B: one OMP provider/model completed the v2 wrong-answer → exact attempt read → adaptive revision-2 publication loop. Tern rendered both revisions, and a targeted OMP publish opened beside its source pane. Other providers, automatic Tern `TERN_PANE` propagation in every launch mode, user-level OMP packaging, and remote hosts are unverified.
+- Lesson diagrams use curated standard-tuning shapes only; database coverage is incomplete and hand comfort/stretch is not validated.
+- V2 quizzes currently support deriving only the displayed chord shape's lowest sounding pitch class. Score-selection context, automatic Agent launch, free-form theory questions, audio comparison, and learner mastery modeling are not implemented.
+- Remote Tern hosts need a real cross-host transport; the local file bridge does not share data across machines.
